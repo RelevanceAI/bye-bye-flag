@@ -14,10 +14,14 @@ Remove stale feature flags from codebases using AI.
 ## Installation
 
 ```bash
-git clone https://github.com/your-org/bye-bye-flag.git
+git clone https://github.com/RelevanceAI/bye-bye-flag.git
 cd bye-bye-flag
 nvm use
 pnpm install
+
+# Create .env file with your configuration
+cp .env.example .env
+# Edit .env with your PostHog API key and project IDs
 ```
 
 ## Directory Structure
@@ -66,6 +70,25 @@ pnpm start remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/my
 
 The agent runs in git worktrees, which isolates all file changes from your main repositories.
 
+## Idempotency & Resuming
+
+The tool is designed to be idempotent and safe to run multiple times:
+
+- **Open PRs block re-runs**: If a PR already exists for a flag, the tool will refuse to run and point you to the existing PR.
+- **Closed/merged PRs allow re-runs**: If a PR was merged or closed (without being declined), you can run the tool again to create a fresh PR.
+- **Declined PRs**: If a PR is closed because the flag removal was rejected, add `[DECLINED]` to the PR title. This prevents future removal attempts for that flag.
+- **Worktrees are preserved**: After creating a PR, the worktree is kept for resuming the Claude session. Worktrees are automatically cleaned up when their PR is merged or closed.
+
+### Resuming a Session
+
+If you need to make changes or continue working on a PR, the PR description includes a resume command:
+
+```bash
+cd /tmp/bye-bye-flag-worktrees/remove-flag-my-flag && claude --resume <session-id>
+```
+
+This lets you continue the Claude Code session with full context of what was already done.
+
 ## Configuration
 
 Create a `bye-bye-flag.json` in your repos directory:
@@ -100,10 +123,65 @@ These files are automatically included in the prompt.
 
 ## Environment Variables
 
+Create a `.env` file (copy from `.env.example`):
+
 ```bash
 # Custom worktree location (default: /tmp/bye-bye-flag-worktrees)
 WORKTREE_BASE_PATH=/path/to/worktrees
+
+# PostHog integration (required for fetching stale flags)
+POSTHOG_API_KEY=phx_xxx
+
+# Single project:
+POSTHOG_PROJECT_ID=12345
+
+# Or multiple projects (comma-separated, e.g., dev and prod):
+POSTHOG_PROJECT_IDS=12345,67890
 ```
+
+## Fetching Stale Flags (PostHog)
+
+The PostHog fetcher finds flags that are candidates for removal.
+
+**Criteria for stale flags:**
+- Updated more than 30 days ago (configurable)
+- Either 0% or 100% rollout (no partial rollouts or complex targeting)
+- No payload
+- No multivariate variants
+- If flag exists in multiple projects, must be consistent across all
+
+**Inactive flags** are also included with `keepBranch: "disabled"`.
+
+```bash
+# Fetch stale flags
+pnpm run fetch:posthog
+
+# Custom stale threshold (days)
+pnpm run fetch:posthog -- --stale-days=60
+
+# Show all flags with their status (not just stale ones)
+pnpm run fetch:posthog -- --show-all
+```
+
+Output is JSON to stdout:
+```json
+[
+  {
+    "key": "old-feature",
+    "keepBranch": "enabled",
+    "reason": "100% rollout for 45 days",
+    "projects": ["12345", "67890"]
+  },
+  {
+    "key": "killed-feature",
+    "keepBranch": "disabled",
+    "reason": "Inactive for 90 days",
+    "projects": ["12345"]
+  }
+]
+```
+
+This can be piped to other tools or used to drive the removal agent.
 
 ## Example Output
 

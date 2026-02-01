@@ -4,12 +4,12 @@
   "description": "Remove stale feature flags from codebases using AI",
   "type": "module",
   "scripts": {
-    "start": "node src/cli.ts",
+    "start": "node --env-file-if-exists=.env src/cli.ts",
+    "fetch:posthog": "node --env-file-if-exists=.env src/fetchers/posthog.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "chalk": "^5.4.1",
-    "dotenv": "^16.5.0",
     "execa": "^9.5.3",
     "uuid": "^11.1.0",
     "zod": "^3.24.4"

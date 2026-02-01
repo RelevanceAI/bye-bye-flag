@@ -1,4 +1,4 @@
-import 'dotenv/config';
+// Environment variables loaded via Node's --env-file-if-exists flag (gracefully handles missing .env files)
 
 export const CONFIG = {
   // Worktree settings

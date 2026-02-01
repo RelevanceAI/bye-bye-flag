@@ -80,10 +80,8 @@ export async function setupMultiRepoWorktrees(
     await execa('git', ['branch', '-D', branchName], { cwd: repoPath, reject: false });
     await execa('git', ['push', 'origin', '--delete', branchName], { cwd: repoPath, reject: false });
 
-    // Get default branch and fetch latest from remote
+    // Get default branch (already fetched in removeFlag before scaffolding)
     const defaultBranch = await getDefaultBranch(repoPath);
-    console.log(`Fetching latest from origin for ${repoName}...`);
-    await execa('git', ['fetch', 'origin', defaultBranch], { cwd: repoPath, stdio: 'inherit' });
 
     // Create worktree with the new branch based on origin's default branch
     console.log(`Creating worktree for ${repoName} on branch ${branchName}...`);
@@ -143,16 +141,16 @@ export async function cleanupMultiRepoWorktrees(result: ScaffoldResult): Promise
 /**
  * Gets the default branch name (main or master)
  */
-async function getDefaultBranch(repoPath: string): Promise<string> {
+export async function getDefaultBranch(repoPath: string): Promise<string> {
   try {
     const { stdout } = await execa('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], {
       cwd: repoPath,
     });
     return stdout.replace('refs/remotes/origin/', '').trim();
   } catch {
-    // Fallback: check if main or master exists
+    // Fallback: check if origin/main or origin/master exists
     try {
-      await execa('git', ['rev-parse', '--verify', 'main'], { cwd: repoPath });
+      await execa('git', ['rev-parse', '--verify', 'origin/main'], { cwd: repoPath });
       return 'main';
     } catch {
       return 'master';

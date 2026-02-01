@@ -145,9 +145,10 @@ export async function invokeClaudeCode(
   branchName: string,
   prompt: string,
   reposDir: string,
-  repoName?: string // For single-repo mode, to get repo-specific shellInit
+  repoName?: string, // For single-repo mode, to get repo-specific shellInit
+  providedSessionId?: string // Optional: use existing session ID (for resume)
 ): Promise<AgentOutput> {
-  const sessionId = getSessionId(branchName);
+  const sessionId = providedSessionId || getSessionId(branchName);
   const shellInit = await getShellInit(reposDir, repoName);
 
   console.log(`Invoking Claude Code (session: ${sessionId.slice(0, 8)}...)...`);

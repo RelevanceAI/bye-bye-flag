@@ -13,23 +13,8 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { execa } from 'execa';
 import { CONFIG } from './config.ts';
-
-interface RepoEntry {
-  shellInit?: string;
-  mainSetup?: string[];
-  setup: string[];
-}
-
-interface ReposConfig {
-  shellInit?: string;
-  repos: Record<string, RepoEntry>;
-}
-
-async function readConfig(reposDir: string): Promise<ReposConfig> {
-  const configPath = path.join(reposDir, 'bye-bye-flag.json');
-  const content = await fs.readFile(configPath, 'utf-8');
-  return JSON.parse(content);
-}
+import { getDefaultBranch, readConfig, type ByeByeFlagConfig } from './agent/scaffold.ts';
+import { loadEnvFileIfExists } from './env.ts';
 
 async function runCommand(cmd: string, cwd: string, shellInit?: string): Promise<boolean> {
   const shellPrefix = shellInit ? `${shellInit} && ` : '';
@@ -54,7 +39,7 @@ async function runCommand(cmd: string, cwd: string, shellInit?: string): Promise
 async function testRepo(
   reposDir: string,
   repoName: string,
-  config: ReposConfig,
+  config: ByeByeFlagConfig,
   options: { skipMainSetup?: boolean; skipWorktree?: boolean }
 ): Promise<boolean> {
   const repoConfig = config.repos[repoName];
@@ -98,20 +83,7 @@ async function testRepo(
   console.log(`  Path: ${worktreePath}`);
 
   try {
-    // Get default branch
-    let defaultBranch = 'main';
-    try {
-      const { stdout } = await execa('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], { cwd: repoPath });
-      defaultBranch = stdout.replace('refs/remotes/origin/', '').trim();
-    } catch {
-      // Try main, fallback to master
-      try {
-        await execa('git', ['rev-parse', '--verify', 'origin/main'], { cwd: repoPath });
-        defaultBranch = 'main';
-      } catch {
-        defaultBranch = 'master';
-      }
-    }
+    const defaultBranch = await getDefaultBranch(repoPath);
 
     // Create worktree
     await fs.mkdir(path.dirname(worktreePath), { recursive: true });
@@ -152,7 +124,12 @@ async function testRepo(
 }
 
 async function main() {
+  loadEnvFileIfExists('.env');
+  const rawArgs = process.argv.slice(2);
+  const args = rawArgs[0] === '--' ? rawArgs.slice(1) : rawArgs;
+
   const { values } = parseArgs({
+    args,
     options: {
       'repos-dir': { type: 'string' },
       'repo': { type: 'string' },
@@ -170,7 +147,7 @@ Usage:
   pnpm test-setup --repos-dir=/path/to/repos [options]
 
 Options:
-  --repos-dir=<path>    Path to directory containing bye-bye-flag.json (required)
+  --repos-dir=<path>    Path to directory containing bye-bye-flag-config.json (required)
   --repo=<name>         Test only this repo (default: test all)
   --skip-main-setup     Skip mainSetup commands (test only worktree setup)
   --skip-worktree       Skip worktree creation (test only mainSetup)

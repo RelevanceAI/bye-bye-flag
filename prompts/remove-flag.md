@@ -91,12 +91,27 @@ If they fail for unrelated reasons (pre-existing issues), note this in your summ
 
 ### Step 5: Output result
 
-After completing all steps, provide a summary that includes:
-- What was done (or why you're refusing)
-- List of files that were modified
-- Whether tests, lint, and typecheck passed
+After completing all steps, provide your normal human-readable summary.
 
-You can format this however you like - the output will be processed automatically.
+Then, **best-effort**, append a machine-readable result block in the format below. This helps the caller parse results reliably.
+If you forget (long/complex tasks sometimes cause context rot), that's okay — the caller will fall back to normalizing your output.
+
+1) Print this delimiter on its own line: `---RESULT---`
+
+2) Immediately after, print a single JSON object (no markdown fences):
+
+{
+  "status": "success" | "refused",
+  "summary": "brief description of what was done (or why you refused)",
+  "filesChanged": ["array", "of", "file", "paths"],
+  "testsPass": true/false,
+  "lintPass": true/false,
+  "typecheckPass": true/false
+}
+
+Rules:
+- If tests/lint/typecheck were skipped or not run, set them to `true`.
+- If you refuse (e.g. flag not found / too risky), use `"status": "refused"` and explain in `summary`.
 
 ## Important Rules
 

@@ -1,17 +1,20 @@
 #!/usr/bin/env node
 
 import { parseArgs } from 'node:util';
-import * as fs from 'fs/promises';
 import { removeFlag } from './agent/index.ts';
 import { run, runWithInput } from './orchestrator/index.ts';
 import { readConfig } from './agent/scaffold.ts';
 import { setupSignalHandlers } from './process-tracker.ts';
 import type { FetcherConfig } from './fetchers/types.ts';
+import { loadEnvFileIfExists } from './env.ts';
 
 const helpText = `
 bye-bye-flag - Remove stale feature flags from codebases using AI
 
 Usage:
+  bye-bye-flag <command> [options]
+
+  # From source (after pnpm install)
   pnpm start <command> [options]
 
 Commands:
@@ -19,7 +22,7 @@ Commands:
   remove    Remove a single flag (for testing/manual use)
 
 Options for 'run':
-  --repos-dir=<path>     Path to directory containing bye-bye-flag.json (required)
+  --repos-dir=<path>     Path to directory containing bye-bye-flag-config.json (required)
   --concurrency=<n>      Max agents running in parallel (default: 2)
   --max-prs=<n>          Stop after creating this many PRs (default: 10)
   --log-dir=<path>       Directory for agent logs (default: ./bye-bye-flag-logs)
@@ -29,15 +32,18 @@ Options for 'run':
 Options for 'remove':
   --flag=<key>           The feature flag key to remove (required)
   --keep=<branch>        Which branch to keep: "enabled" or "disabled" (required)
-  --repos-dir=<path>     Path to directory containing bye-bye-flag.json (required)
+  --repos-dir=<path>     Path to directory containing bye-bye-flag-config.json (required)
   --dry-run              Show diff without creating PR
   --keep-worktree        Keep worktree after completion
 
-Configuration (bye-bye-flag.json):
+Configuration (bye-bye-flag-config.json):
   {
     "fetcher": {
       "type": "posthog",
       "staleDays": 30
+    },
+    "agent": {
+      "type": "claude"
     },
     "orchestrator": {
       "concurrency": 2,
@@ -50,33 +56,27 @@ Configuration (bye-bye-flag.json):
 
 Examples:
   # Run the orchestrator (fetches stale flags and processes them)
-  pnpm start run --repos-dir=/path/to/repos
+  bye-bye-flag run --repos-dir=/path/to/repos
 
   # Dry run to see what would happen
-  pnpm start run --repos-dir=/path/to/repos --dry-run
+  bye-bye-flag run --repos-dir=/path/to/repos --dry-run
 
   # Process a custom list of flags
-  pnpm start run --repos-dir=/path/to/repos --input=my-flags.json
+  bye-bye-flag run --repos-dir=/path/to/repos --input=my-flags.json
 
   # Remove a single flag manually
-  pnpm start remove --flag=my-flag --keep=enabled --repos-dir=/path/to/repos
+  bye-bye-flag remove --flag=my-flag --keep=enabled --repos-dir=/path/to/repos
 `;
 
-interface ExtendedConfig {
-  fetcher?: FetcherConfig;
-  orchestrator?: {
-    concurrency?: number;
-    maxPrs?: number;
-    logDir?: string;
-  };
-  repos: Record<string, { setup: string[]; shellInit?: string }>;
-  shellInit?: string;
-}
-
 async function main() {
+  loadEnvFileIfExists('.env');
   setupSignalHandlers();
+  const rawArgs = process.argv.slice(2);
+  const args = rawArgs[0] === '--' ? rawArgs.slice(1) : rawArgs;
+
   const { values, positionals } = parseArgs({
     allowPositionals: true,
+    args,
     options: {
       // Shared
       'repos-dir': { type: 'string' },
@@ -113,22 +113,39 @@ async function main() {
     const reposDir = values['repos-dir'];
 
     // Read config to get fetcher and orchestrator settings
-    let config: ExtendedConfig;
+    let config: Awaited<ReturnType<typeof readConfig>>;
     try {
-      const configPath = `${reposDir}/bye-bye-flag.json`;
-      const content = await fs.readFile(configPath, 'utf-8');
-      config = JSON.parse(content);
-    } catch {
-      console.error(`Error: Could not read bye-bye-flag.json from ${reposDir}`);
+      config = await readConfig(reposDir);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Error: ${message}`);
       process.exit(1);
     }
 
     // Helper to parse and validate numeric CLI arguments
-    const parsePositiveInt = (value: string | undefined, name: string, defaultValue?: number): number | undefined => {
+    const parsePositiveInt = (
+      value: string | undefined,
+      name: string,
+      defaultValue?: number
+    ): number | undefined => {
       if (value === undefined) return defaultValue;
       const parsed = parseInt(value, 10);
-      if (isNaN(parsed) || parsed < 1 || !Number.isInteger(parsed)) {
+      if (!Number.isFinite(parsed) || parsed < 1 || !Number.isInteger(parsed)) {
         console.error(`Error: --${name} must be a positive integer, got "${value}"`);
+        process.exit(1);
+      }
+      return parsed;
+    };
+
+    const parseNonNegativeInt = (
+      value: string | undefined,
+      name: string,
+      defaultValue?: number
+    ): number | undefined => {
+      if (value === undefined) return defaultValue;
+      const parsed = parseInt(value, 10);
+      if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
+        console.error(`Error: --${name} must be a non-negative integer, got "${value}"`);
         process.exit(1);
       }
       return parsed;
@@ -138,7 +155,7 @@ async function main() {
     const concurrency =
       parsePositiveInt(values.concurrency, 'concurrency', config.orchestrator?.concurrency) ?? 2;
     const maxPrs =
-      parsePositiveInt(values['max-prs'], 'max-prs', config.orchestrator?.maxPrs) ?? 10;
+      parseNonNegativeInt(values['max-prs'], 'max-prs', config.orchestrator?.maxPrs) ?? 10;
     const logDir = values['log-dir'] || config.orchestrator?.logDir;
 
     // If --input is provided, use file instead of fetcher

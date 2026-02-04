@@ -10,7 +10,7 @@ import { execa } from 'execa';
 import { fetchFlags, type FlagToRemove, type FetcherConfig } from '../fetchers/index.ts';
 import { removeFlag } from '../agent/index.ts';
 import { fetchAllFlagPRs, type ExistingPR } from '../agent/git.ts';
-import { readConfig } from '../agent/scaffold.ts';
+import { getDefaultBranch, readConfig } from '../agent/scaffold.ts';
 import { createRunLogger, type FlagLogger, type LogStatus } from './logger.ts';
 import type { RemovalResult } from '../types.ts';
 import { CONFIG } from '../config.ts';
@@ -52,6 +52,7 @@ export interface RunSummary {
   results: {
     prsCreated: number;
     noChanges: number;
+    noCodeReferences: number;
     failed: number;
     skipped: number;
     remaining: number;
@@ -64,23 +65,20 @@ const DEFAULT_CONCURRENCY = 2;
 const DEFAULT_MAX_PRS = 10;
 const DEFAULT_LOG_DIR = './bye-bye-flag-logs';
 
+type FlagWithCodeReferences = FlagToRemove & { reposWithCode: string[] };
+
 /**
  * Check if a flag exists in a single git repo using git grep on origin's default branch
  */
-async function flagExistsInRepo(repoPath: string, flagKey: string): Promise<boolean> {
+async function flagExistsInRepo(
+  repoPath: string,
+  flagKey: string,
+  defaultBranch: string
+): Promise<boolean> {
   // Escape regex special characters in the flag key
   const escapedKey = flagKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   // Search for flag key in quotes (single, double, or backtick) to avoid false positives
   const pattern = `["'\`]${escapedKey}["'\`]`;
-
-  // Get default branch
-  const { stdout: defaultBranch } = await execa('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], {
-    cwd: repoPath,
-    reject: false,
-  }).then(
-    (r) => ({ stdout: r.stdout.replace('refs/remotes/origin/', '').trim() }),
-    () => ({ stdout: 'main' }) // Fallback
-  );
 
   // Search on origin/defaultBranch to check the latest remote code
   const result = await execa('git', ['grep', '-lE', pattern, `origin/${defaultBranch}`], {
@@ -97,14 +95,26 @@ async function flagExistsInRepo(repoPath: string, flagKey: string): Promise<bool
 async function filterFlagsWithCodeReferences(
   flags: FlagToRemove[],
   reposDir: string
-): Promise<{ flagsWithCode: FlagToRemove[]; flagsWithoutCode: FlagResult[] }> {
+): Promise<{ flagsWithCode: FlagWithCodeReferences[]; flagsWithoutCode: FlagResult[] }> {
   const config = await readConfig(reposDir);
   const repoNames = Object.keys(config.repos);
 
   console.log('Checking for code references...');
 
-  const flagsWithCode: FlagToRemove[] = [];
+  const flagsWithCode: FlagWithCodeReferences[] = [];
   const flagsWithoutCode: FlagResult[] = [];
+
+  const defaultBranchByRepo = new Map<string, string>();
+  await Promise.all(
+    repoNames.map(async (repoName) => {
+      const repoPath = path.join(reposDir, repoName);
+      try {
+        defaultBranchByRepo.set(repoName, await getDefaultBranch(repoPath));
+      } catch {
+        defaultBranchByRepo.set(repoName, 'main');
+      }
+    })
+  );
 
   // Check each flag in parallel (batch of concurrent checks)
   const BATCH_SIZE = 10;
@@ -112,24 +122,28 @@ async function filterFlagsWithCodeReferences(
     const batch = flags.slice(i, i + BATCH_SIZE);
     const results = await Promise.all(
       batch.map(async (flag) => {
+        const reposWithCode: string[] = [];
+
         // Check if flag exists in any repo
         for (const repoName of repoNames) {
           const repoPath = path.join(reposDir, repoName);
           try {
-            if (await flagExistsInRepo(repoPath, flag.key)) {
-              return { flag, hasCode: true };
+            const defaultBranch = defaultBranchByRepo.get(repoName) ?? 'main';
+            if (await flagExistsInRepo(repoPath, flag.key, defaultBranch)) {
+              reposWithCode.push(repoName);
             }
           } catch {
             // Skip repos we can't check
           }
         }
-        return { flag, hasCode: false };
+
+        return { flag, reposWithCode };
       })
     );
 
-    for (const { flag, hasCode } of results) {
-      if (hasCode) {
-        flagsWithCode.push(flag);
+    for (const { flag, reposWithCode } of results) {
+      if (reposWithCode.length > 0) {
+        flagsWithCode.push({ ...flag, reposWithCode });
       } else {
         console.log(`  ○ ${flag.key}: No code references`);
         flagsWithoutCode.push({
@@ -353,15 +367,16 @@ async function filterFlagsWithExistingPRs(
 }
 
 /**
- * Process flags with concurrency control
+ * Process flags with concurrency control and a PR budget.
  *
- * Uses a simple worker pattern:
- * - Queue starts with min(maxPrs, total) flags
- * - Workers process until queue is empty
- * - When a flag completes WITHOUT creating a PR, another flag is added to the queue
+ * We reserve PR budget per flag based on the number of repos where the flag key
+ * has code references (an upper bound on how many PRs that flag can create).
+ * If the agent produces fewer PRs than reserved, we refund the unused budget so
+ * we can keep processing more flags. In dry-run mode, we treat reserved budget
+ * as spent so `--max-prs` still caps the amount of work performed.
  */
 async function processFlags(
-  flagsToRun: FlagToRemove[],
+  flagsToRun: FlagWithCodeReferences[],
   config: {
     reposDir: string;
     concurrency: number;
@@ -370,17 +385,22 @@ async function processFlags(
   },
   runLogger: { createFlagLogger: (key: string) => Promise<FlagLogger> },
   skippedFlags: FlagResult[]
-): Promise<{ results: FlagResult[]; remaining: FlagToRemove[] }> {
-  // Split flags: initial queue (up to maxPrs) and remaining
-  const queue = flagsToRun.slice(0, config.maxPrs);
-  const remaining = flagsToRun.slice(config.maxPrs);
+): Promise<{ results: FlagResult[]; remaining: FlagWithCodeReferences[] }> {
+  const byeByeConfig = await readConfig(config.reposDir);
+  const agentKind = byeByeConfig.agent?.type ?? 'claude';
+
+  const queue = [...flagsToRun];
   const results: FlagResult[] = [...skippedFlags];
-  let prsCreated = 0;
+  let remainingPrBudget = config.maxPrs;
   let consecutiveFailures = 0;
   const MAX_CONSECUTIVE_FAILURES = 3;
   let shouldStop = false;
 
   console.log(`Processing up to ${config.maxPrs} PRs with concurrency ${config.concurrency}...\n`);
+
+  if (config.maxPrs <= 0) {
+    return { results, remaining: queue };
+  }
 
   // Process a single flag, returns the number of PRs created
   const processOneFlag = async (flag: FlagToRemove): Promise<number> => {
@@ -390,10 +410,13 @@ async function processFlags(
     try {
       logger = await runLogger.createFlagLogger(flag.key);
       const worktreePath = path.join(CONFIG.worktreeBasePath, `remove-flag-${flag.key}`);
-      console.log(`▶ Starting: ${flag.key} (${prsCreated}/${config.maxPrs} PRs)`);
+      console.log(
+        `▶ Starting (${agentKind}): ${flag.key} (${config.maxPrs - remainingPrBudget}/${config.maxPrs} PRs reserved)`
+      );
       console.log(`    Keep: ${flag.keepBranch} | Worktree: ${worktreePath}`);
       console.log(`    Log: ${logger.path}`);
       logger.log(`Starting removal of flag: ${flag.key}`);
+      logger.log(`Agent: ${agentKind}`);
       logger.log(`Keep branch: ${flag.keepBranch}`);
       if (flag.reason) logger.log(`Reason: ${flag.reason}`);
 
@@ -411,8 +434,11 @@ async function processFlags(
       if (result.status === 'success') {
         consecutiveFailures = 0;
         const prUrls = result.repoResults?.filter((r) => r.prUrl).map((r) => r.prUrl!) || [];
-        if (prUrls.length > 0) {
-          console.log(`✓ Complete: ${flag.key} (${prUrls.length} PR(s), ${prsCreated + prUrls.length}/${config.maxPrs} total, ${formatDuration(durationMs)})`);
+        if (config.dryRun) {
+          console.log(`○ Complete: ${flag.key} (dry-run, ${formatDuration(durationMs)})`);
+          await logger.finish('complete', 'Dry-run complete');
+        } else if (prUrls.length > 0) {
+          console.log(`✓ Complete: ${flag.key} (${prUrls.length} PR(s), ${formatDuration(durationMs)})`);
           await logger.finish('complete', `${prUrls.length} PR(s) created`);
         } else {
           console.log(`○ Complete: ${flag.key} (no changes needed, ${formatDuration(durationMs)})`);
@@ -455,36 +481,62 @@ async function processFlags(
     }
   };
 
-  // Worker: pulls from queue until empty
-  const worker = async (): Promise<void> => {
-    while (!shouldStop) {
-      const flag = queue.shift();
-      if (!flag) break;
+  const inFlight = new Set<Promise<void>>();
 
+  const tryStartOne = (): boolean => {
+    if (shouldStop) return false;
+    if (inFlight.size >= config.concurrency) return false;
+    if (remainingPrBudget <= 0) return false;
+    if (queue.length === 0) return false;
+
+    // Pick the next flag that fits in the remaining PR budget. This avoids getting stuck
+    // if the head of the queue would exceed the remaining budget.
+    const nextIndex = queue.findIndex((f) => f.reposWithCode.length <= remainingPrBudget);
+    if (nextIndex === -1) return false;
+
+    const flag = queue.splice(nextIndex, 1)[0];
+    const reserved = Math.max(1, flag.reposWithCode.length);
+    remainingPrBudget -= reserved;
+
+    const task = (async () => {
       const prsFromFlag = await processOneFlag(flag);
-      prsCreated += prsFromFlag;
 
-      // If no PR was created, add another flag to the queue (if available)
-      if (prsFromFlag === 0 && remaining.length > 0 && !shouldStop) {
-        queue.push(remaining.shift()!);
+      // In dry-run mode we never create PRs, but we still want --max-prs to cap how
+      // much work we do. So we treat reserved budget as "spent" and do not refund.
+      if (!config.dryRun) {
+        const unused = reserved - prsFromFlag;
+        if (unused > 0) remainingPrBudget += unused;
       }
-    }
+
+    })().finally(() => {
+      inFlight.delete(task);
+    });
+
+    inFlight.add(task);
+    return true;
   };
 
-  // Start workers
-  const numWorkers = Math.min(config.concurrency, queue.length);
-  await Promise.all(Array(numWorkers).fill(null).map(() => worker()));
+  while (!shouldStop) {
+    // Fill up the pool
+    while (tryStartOne()) {
+      // keep starting
+    }
 
-  // Any unprocessed queue items go back to remaining
-  remaining.unshift(...queue);
-
-  if (remaining.length > 0 && !shouldStop) {
-    console.log(`\nReached ${config.maxPrs} PRs limit. ${remaining.length} flags remaining for next run.`);
-  } else if (remaining.length > 0 && shouldStop) {
-    console.log(`\n${remaining.length} flags not attempted due to consecutive failures.`);
+    if (inFlight.size === 0) break;
+    await Promise.race(inFlight);
   }
 
-  return { results, remaining };
+  // Wait for anything still in flight
+  await Promise.all(inFlight);
+
+  if (queue.length > 0 && !shouldStop) {
+    const reason = remainingPrBudget <= 0 ? `Reached ${config.maxPrs} PRs limit` : 'No remaining budget to fit next flag';
+    console.log(`\n${reason}. ${queue.length} flag(s) remaining for next run.`);
+  } else if (queue.length > 0 && shouldStop) {
+    console.log(`\n${queue.length} flag(s) not attempted due to consecutive failures.`);
+  }
+
+  return { results, remaining: queue };
 }
 
 /**
@@ -693,11 +745,15 @@ function createSummary(
 ): RunSummary {
   const endTime = new Date();
 
-  const prsCreated = results.filter(
-    (r) => r.status === 'complete' && r.prUrls && r.prUrls.length > 0
+  const prsCreated = results.reduce((sum, r) => sum + (r.prUrls?.length ?? 0), 0);
+  const noCodeReferences = results.filter(
+    (r) => r.status === 'complete' && r.skippedReason === 'No code references found'
   ).length;
   const noChanges = results.filter(
-    (r) => r.status === 'complete' && (!r.prUrls || r.prUrls.length === 0)
+    (r) =>
+      r.status === 'complete' &&
+      (r.prUrls?.length ?? 0) === 0 &&
+      r.skippedReason !== 'No code references found'
   ).length;
   const failed = results.filter((r) => r.status === 'failed').length;
   const skipped = results.filter((r) => r.status === 'skipped').length;
@@ -719,6 +775,7 @@ function createSummary(
     results: {
       prsCreated,
       noChanges,
+      noCodeReferences,
       failed,
       skipped,
       remaining: remainingCount,
@@ -739,7 +796,8 @@ function printSummary(summary: RunSummary): void {
   console.log(`Processed: ${summary.input.processed} flags`);
   console.log('');
   console.log(`  ✓ ${summary.results.prsCreated} PRs created`);
-  console.log(`  ○ ${summary.results.noChanges} no code references`);
+  console.log(`  ○ ${summary.results.noChanges} no changes needed`);
+  console.log(`  ○ ${summary.results.noCodeReferences} no code references`);
   console.log(`  ✗ ${summary.results.failed} failed`);
   console.log(`  ⊘ ${summary.results.skipped} skipped`);
 

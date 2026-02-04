@@ -1,11 +1,11 @@
-// Environment variables loaded via Node's --env-file-if-exists flag (gracefully handles missing .env files)
+// Environment variables are loaded by the CLI via `src/env.ts` (gracefully handles missing .env files)
 
 export const CONFIG = {
   // Worktree settings
   worktreeBasePath: process.env.WORKTREE_BASE_PATH || '/tmp/bye-bye-flag-worktrees',
 
-  // Claude Code settings
-  claudeTimeout: 30 * 60 * 1000, // 30 minutes
+  // Agent settings
+  agentTimeoutMs: 30 * 60 * 1000, // 30 minutes
 
   // Branch naming
   branchPrefix: 'remove-flag/',

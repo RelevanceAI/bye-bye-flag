@@ -13,6 +13,7 @@
 
 import { fetchFlags, showAllFlags } from './index.ts';
 import type { PostHogFetcherConfig } from '../types.ts';
+import { loadEnvFileIfExists } from '../../env.ts';
 
 function parseArgs(): { staleDays: number; showAll: boolean } {
   const args = process.argv.slice(2);
@@ -21,7 +22,12 @@ function parseArgs(): { staleDays: number; showAll: boolean } {
 
   for (const arg of args) {
     if (arg.startsWith('--stale-days=')) {
-      staleDays = parseInt(arg.split('=')[1], 10);
+      const value = arg.split('=')[1] ?? '';
+      const parsed = parseInt(value, 10);
+      if (!Number.isFinite(parsed) || parsed < 1) {
+        throw new Error(`--stale-days must be a positive integer, got "${value}"`);
+      }
+      staleDays = parsed;
     } else if (arg === '--show-all') {
       showAll = true;
     }
@@ -31,7 +37,15 @@ function parseArgs(): { staleDays: number; showAll: boolean } {
 }
 
 async function main() {
-  const { staleDays, showAll } = parseArgs();
+  loadEnvFileIfExists('.env');
+  let staleDays: number;
+  let showAll: boolean;
+  try {
+    ({ staleDays, showAll } = parseArgs());
+  } catch (error) {
+    console.error('Error:', error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
 
   const config: PostHogFetcherConfig = {
     type: 'posthog',

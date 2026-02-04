@@ -4,8 +4,8 @@ import { CONFIG } from '../config.ts';
 import { AgentOutputSchema, consoleLogger, type AgentOutput, type Logger } from '../types.ts';
 import { getShellInit } from './scaffold.ts';
 import { registerChildProcess } from '../process-tracker.ts';
+import { parseAgentOutputFromText } from './output.ts';
 
-const RESULT_DELIMITER = '---RESULT---';
 const MAX_RETRIES = 2;
 
 /**
@@ -152,7 +152,8 @@ export async function invokeClaudeCode(
   reposDir: string,
   repoName?: string, // For single-repo mode, to get repo-specific shellInit
   providedSessionId?: string, // Optional: use existing session ID (for resume)
-  logger: Logger = consoleLogger // Optional logger (defaults to console)
+  logger: Logger = consoleLogger, // Optional logger (defaults to console)
+  extraArgs: string[] = []
 ): Promise<AgentOutput> {
   const sessionId = providedSessionId || getSessionId(branchName);
   const shellInit = await getShellInit(reposDir, repoName);
@@ -168,10 +169,11 @@ export async function invokeClaudeCode(
     '--dangerously-skip-permissions',
     '--output-format', 'stream-json',
     '--verbose',
+    ...extraArgs,
     '-p', prompt,
   ];
 
-  let result = await runClaudeCode(initialArgs, worktreePath, CONFIG.claudeTimeout, shellInit, logger);
+  let result = await runClaudeCode(initialArgs, worktreePath, CONFIG.agentTimeoutMs, shellInit, logger);
   let retries = 0;
 
   // Retry with --resume if timed out
@@ -188,10 +190,11 @@ export async function invokeClaudeCode(
       '--dangerously-skip-permissions',
       '--output-format', 'stream-json',
       '--verbose',
+      ...extraArgs,
       '-p', resumePrompt,
     ];
 
-    const resumeResult = await runClaudeCode(resumeArgs, worktreePath, CONFIG.claudeTimeout, shellInit, logger);
+    const resumeResult = await runClaudeCode(resumeArgs, worktreePath, CONFIG.agentTimeoutMs, shellInit, logger);
     result = {
       stdout: result.stdout + resumeResult.stdout,
       timedOut: resumeResult.timedOut,
@@ -220,7 +223,8 @@ export async function resumeClaudeCode(
   worktreePath: string,
   sessionId: string,
   additionalPrompt?: string,
-  logger: Logger = consoleLogger
+  logger: Logger = consoleLogger,
+  extraArgs: string[] = []
 ): Promise<AgentOutput> {
   logger.log(`Resuming Claude Code session (${sessionId.slice(0, 8)}...)...`);
   logger.log('--- Claude Code Output ---');
@@ -230,12 +234,13 @@ export async function resumeClaudeCode(
     '--dangerously-skip-permissions',
     '--output-format', 'stream-json',
     '--verbose',
+    ...extraArgs,
   ];
   if (additionalPrompt) {
     args.push('-p', additionalPrompt);
   }
 
-  const result = await runClaudeCode(args, worktreePath, CONFIG.claudeTimeout, undefined, logger);
+  const result = await runClaudeCode(args, worktreePath, CONFIG.agentTimeoutMs, undefined, logger);
 
   logger.log('--- End Claude Code Output ---');
 
@@ -371,6 +376,41 @@ ${rawOutput.length > 12000
   });
 }
 
+function tryParseAgentOutputFromText(text: string): AgentOutput | null {
+  // 1) Prefer JSON fenced blocks if present (common)
+  const codeBlocks = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)];
+  for (const match of codeBlocks.reverse()) {
+    const candidate = match[1]?.trim();
+    if (!candidate) continue;
+    try {
+      const parsed = JSON.parse(candidate);
+      return AgentOutputSchema.parse(parsed);
+    } catch {
+      // Keep trying
+    }
+  }
+
+  // 2) Heuristic: scan backwards for a JSON object and validate against our schema.
+  const lastClose = text.lastIndexOf('}');
+  if (lastClose === -1) return null;
+
+  let start = text.lastIndexOf('{', lastClose);
+  let attempts = 0;
+  while (start !== -1 && attempts < 25) {
+    const candidate = text.slice(start, lastClose + 1).trim();
+    try {
+      const parsed = JSON.parse(candidate);
+      return AgentOutputSchema.parse(parsed);
+    } catch {
+      // Try an earlier '{'
+    }
+    attempts++;
+    start = text.lastIndexOf('{', start - 1);
+  }
+
+  return null;
+}
+
 /**
  * Parses the stream-json output to extract the final result
  * Uses a follow-up Claude call to normalize the output format
@@ -385,46 +425,14 @@ async function parseStreamOutput(stdout: string, cwd: string, logger: Logger): P
     );
   }
 
-  // Try to find our expected format first (fast path)
-  if (text.includes(RESULT_DELIMITER)) {
-    try {
-      return parseAgentOutput(text);
-    } catch {
-      // Fall through to normalization
-    }
-  }
+  // Try parsing locally first:
+  // - best case: strict `---RESULT---` delimiter + JSON
+  // - fallback: JSON code fence or a raw JSON object near the end (context rot)
+  const parsed = parseAgentOutputFromText(text);
+  if (parsed) return parsed;
 
-  // Use Claude to normalize whatever format was output
+  // Last resort: use Claude to normalize whatever format was output.
+  // This exists because after complex tasks the agent may forget the exact delimiter
+  // format, or include extra text around the JSON.
   return normalizeOutput(text, cwd, logger);
-}
-
-/**
- * Parses the structured output from Claude Code's response
- */
-function parseAgentOutput(text: string): AgentOutput {
-  const delimiterIndex = text.lastIndexOf(RESULT_DELIMITER);
-
-  if (delimiterIndex === -1) {
-    throw new Error(
-      `Could not find ${RESULT_DELIMITER} in text.`
-    );
-  }
-
-  const jsonPart = text.slice(delimiterIndex + RESULT_DELIMITER.length).trim();
-
-  // Extract JSON from potential markdown code block
-  let jsonString = jsonPart;
-  const jsonMatch = jsonPart.match(/```(?:json)?\s*([\s\S]*?)```/);
-  if (jsonMatch) {
-    jsonString = jsonMatch[1].trim();
-  }
-
-  try {
-    const parsed = JSON.parse(jsonString);
-    return AgentOutputSchema.parse(parsed);
-  } catch (error) {
-    throw new Error(
-      `Failed to parse agent output as JSON: ${error}\n\nRaw output after delimiter:\n${jsonPart.slice(0, 500)}`
-    );
-  }
 }

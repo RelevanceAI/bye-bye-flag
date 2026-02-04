@@ -1,0 +1,18 @@
+{
+  "fetcher": {
+    "type": "posthog",
+    "staleDays": 30
+  },
+  "orchestrator": {
+    "concurrency": 2,
+    "maxPrs": 10,
+    "logDir": "./bye-bye-flag-logs"
+  },
+  "shellInit": "source ~/.nvm/nvm.sh && nvm use",
+  "repos": {
+    "my-repo": {
+      "mainSetup": ["pnpm install"],
+      "setup": ["cp -al ${MAIN_REPO}/node_modules ./node_modules 2>/dev/null || true"]
+    }
+  }
+}

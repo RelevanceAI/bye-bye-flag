@@ -22,10 +22,8 @@ export interface RemovalRequest {
   keepBranch: 'enabled' | 'disabled';
   dryRun?: boolean;
   keepWorktree?: boolean; // Don't cleanup worktree (for manual inspection)
-  // TODO: Revisit - should we always skip fetch? Depends on whether we need standalone agent usage
-  skipFetch?: boolean; // Skip git fetch (when orchestrator already fetched)
 
-  // Directory containing bye-bye-flag.json and one or more git repos as subdirectories
+  // Directory containing bye-bye-flag-config.json and one or more git repos as subdirectories
   reposDir: string;
 }
 
@@ -54,7 +52,9 @@ export interface RemovalResult {
   error?: string;
 }
 
-// Schema for validating Claude Code's structured output
+export type AgentKind = 'claude' | 'codex';
+
+// Schema for validating the agent's structured output
 export const AgentOutputSchema = z.object({
   status: z.enum(['success', 'refused']),
   summary: z.string(),

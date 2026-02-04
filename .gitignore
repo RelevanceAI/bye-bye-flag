@@ -1,5 +1,7 @@
 # Dependencies
 node_modules/
+package-lock.json
+yarn.lock
 
 # Build output
 dist/
@@ -23,5 +25,6 @@ dist/
 .claude/
 
 # Logs
+bye-bye-flag-logs/
 *.log
 npm-debug.log*

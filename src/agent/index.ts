@@ -2,7 +2,7 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { execa } from 'execa';
 import { CONFIG } from '../config.ts';
-import { consoleLogger, type Logger, type RemovalRequest, type RemovalResult, type RepoResult } from '../types.ts';
+import { consoleLogger, type AgentKind, type Logger, type RemovalRequest, type RemovalResult, type RepoResult } from '../types.ts';
 import {
   setupMultiRepoWorktrees,
   cleanupMultiRepoWorktrees,
@@ -12,11 +12,14 @@ import {
 } from './scaffold.ts';
 import { generatePrompt, readContextFiles } from './prompt.ts';
 import { invokeClaudeCode } from './invoke.ts';
-import { commitAndPushMultiRepo, hasChanges, showDiff } from './git.ts';
+import { invokeCodexCli } from './invoke-codex.ts';
+import { commitAndPushMultiRepo, findExistingPR, hasChanges, showDiff } from './git.ts';
 import { getSessionId } from './invoke.ts';
 
 export interface RemoveFlagOptions extends RemovalRequest {
   logger?: Logger; // Optional logger (defaults to console)
+  // Internal: used by orchestrator to skip redundant preflight checks.
+  skipFetch?: boolean;
 }
 
 /**
@@ -95,11 +98,40 @@ async function checkPrerequisites(request: RemovalRequest): Promise<string[]> {
     errors.push('git is not installed or not in PATH');
   }
 
-  // Check claude CLI is installed
+  // Check repos directory exists
   try {
-    await execa('claude', ['--version']);
+    const stat = await fs.stat(request.reposDir);
+    if (!stat.isDirectory()) {
+      errors.push(`--repos-dir is not a directory: ${request.reposDir}`);
+    }
   } catch {
-    errors.push('claude CLI is not installed. Install with: npm install -g @anthropic-ai/claude-code');
+    errors.push(`--repos-dir does not exist: ${request.reposDir}`);
+  }
+
+  // Read config to determine which agent CLI is required
+  let agentKind: AgentKind | null = null;
+  if (errors.length === 0) {
+    try {
+      const config = await readConfig(request.reposDir);
+      agentKind = (config.agent?.type ?? 'claude') as AgentKind;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(message);
+    }
+  }
+
+  if (agentKind === 'claude') {
+    try {
+      await execa('claude', ['--version']);
+    } catch {
+      errors.push('claude CLI is not installed. Install with: npm install -g @anthropic-ai/claude-code');
+    }
+  } else if (agentKind === 'codex') {
+    try {
+      await execa('codex', ['--version']);
+    } catch {
+      errors.push('codex CLI is not installed. Install Codex CLI first.');
+    }
   }
 
   // Check gh CLI only if we'll create PRs (not dry-run)
@@ -116,26 +148,18 @@ async function checkPrerequisites(request: RemovalRequest): Promise<string[]> {
     }
   }
 
-  // Check repos directory exists
-  try {
-    const stat = await fs.stat(request.reposDir);
-    if (!stat.isDirectory()) {
-      errors.push(`--repos-dir is not a directory: ${request.reposDir}`);
-    }
-  } catch {
-    errors.push(`--repos-dir does not exist: ${request.reposDir}`);
-  }
-
   return errors;
 }
 
 /**
  * Main entry point for the removal agent
- * Operates on a directory containing bye-bye-flag.json and one or more git repos
+ * Operates on a directory containing bye-bye-flag-config.json and one or more git repos
  */
 export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalResult> {
   const { flagKey, keepBranch, reposDir, dryRun, keepWorktree, logger = consoleLogger } = options;
   const branchName = `${CONFIG.branchPrefix}${flagKey}`;
+  let agentKind: AgentKind = 'claude';
+  let agentSessionId: string | undefined;
 
   // Check prerequisites first
   logger.log('Checking prerequisites...');
@@ -162,6 +186,35 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
     logger.log('Fetching latest from origin...');
     await fetchAllRepos(reposDir);
 
+    // In standalone mode (remove command), protect against overwriting an existing open/declined PR.
+    // The orchestrator performs this check in batch before invoking the agent.
+    if (!dryRun) {
+      logger.log('Checking for existing PRs...');
+      const config = await readConfig(reposDir);
+      const repoNames = Object.keys(config.repos);
+
+      for (const repoName of repoNames) {
+        const repoPath = path.join(reposDir, repoName);
+        const existing = await findExistingPR(repoPath, flagKey);
+        if (!existing) continue;
+
+        if (existing.declined) {
+          return {
+            status: 'refused',
+            refusalReason: `Declined PR exists: ${existing.url}`,
+            branchName,
+          };
+        }
+        if (existing.state === 'OPEN') {
+          return {
+            status: 'refused',
+            refusalReason: `Open PR exists: ${existing.url}`,
+            branchName,
+          };
+        }
+      }
+    }
+
     // Check if flag exists in any repo BEFORE scaffolding (saves time if flag not found)
     logger.log(`Checking if flag "${flagKey}" exists in codebase...`);
     const flagExists = await flagExistsInCodebase(reposDir, flagKey);
@@ -186,6 +239,7 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
     scaffoldResult = await setupMultiRepoWorktrees({
       reposDir,
       branchName,
+      deleteRemoteBranch: !dryRun,
       logger,
     });
 
@@ -200,10 +254,9 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
     logger.log(`Found ${scaffoldResult.repos.length} repos:`);
     scaffoldResult.repos.forEach((r) => logger.log(`  - ${r.name}`));
 
-    logger.log(`Launching Claude Code to remove the flag...`);
-
-    // Generate session ID for this run (used for resume capability)
-    const sessionId = getSessionId(branchName);
+    const config = await readConfig(reposDir);
+    agentKind = (config.agent?.type ?? 'claude') as AgentKind;
+    const agentArgs = config.agent?.args ?? [];
 
     // Read context from workspace (copied from reposDir)
     const globalContext = await readContextFiles(scaffoldResult.workspacePath);
@@ -214,16 +267,31 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
       globalContext,
     });
 
-    // Run Claude Code at the workspace root (can see all repos)
-    const agentOutput = await invokeClaudeCode(
-      scaffoldResult.workspacePath,
-      branchName,
-      prompt,
-      reposDir,
-      undefined,
-      sessionId,
-      logger
-    );
+    logger.log(`Launching agent (${agentKind}) to remove the flag...`);
+
+    let agentOutput: Awaited<ReturnType<typeof invokeClaudeCode>>;
+
+    if (agentKind === 'claude') {
+      // Generate session ID for this run (used for resume capability)
+      agentSessionId = getSessionId(branchName);
+      // Run Claude Code at the workspace root (can see all repos)
+      agentOutput = await invokeClaudeCode(
+        scaffoldResult.workspacePath,
+        branchName,
+        prompt,
+        reposDir,
+        undefined,
+        agentSessionId,
+        logger,
+        agentArgs
+      );
+    } else if (agentKind === 'codex') {
+      const codexResult = await invokeCodexCli(scaffoldResult.workspacePath, prompt, reposDir, undefined, logger, agentArgs);
+      agentSessionId = codexResult.sessionId;
+      agentOutput = codexResult.output;
+    } else {
+      throw new Error(`Unknown agent type: ${agentKind}`);
+    }
 
     if (agentOutput.status === 'refused') {
       logger.log(`Agent refused: ${agentOutput.summary}`);
@@ -269,7 +337,8 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
       flagKey,
       keepBranch,
       agentOutput,
-      sessionId,
+      agentKind,
+      agentSessionId,
       scaffoldResult.workspacePath
     );
 
@@ -308,7 +377,7 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
       if (shouldKeep) {
         logger.log(`Worktree preserved at: ${scaffoldResult.workspacePath}`);
         logger.log('The worktree will be automatically cleaned up when the PR is merged or closed.');
-        logger.log('To resume, see the PR description for the Claude --resume command.');
+        logger.log('To resume, see the PR description for the resume command.');
         logger.log('To cleanup manually: rm -rf ' + scaffoldResult.workspacePath);
       } else {
         await cleanupMultiRepoWorktrees(scaffoldResult);

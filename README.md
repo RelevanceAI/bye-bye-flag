@@ -2,13 +2,13 @@
 
 Remove stale feature flags from codebases using AI.
 
-`bye-bye-flag` uses Claude Code to automatically find and remove feature flag conditionals, clean up dead code, and create pull requests.
+`bye-bye-flag` uses a CLI coding agent to automatically find and remove feature flag conditionals, clean up dead code, and create pull requests.
 
 ## Prerequisites
 
 - **Node.js 24+** (native TypeScript support)
 - **git**
-- **[Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code)**: `npm install -g @anthropic-ai/claude-code`
+- **Agent CLI**: either **[Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code)** (`claude`) or **Codex CLI** (`codex`)
 - **[GitHub CLI](https://cli.github.com/)**: Required for creating PRs (not needed for `--dry-run`)
 
 ## Installation
@@ -30,7 +30,7 @@ Set up your repos directory with the following structure:
 
 ```
 my-repos/
-  bye-bye-flag.json    # Config file (required)
+  bye-bye-flag-config.json    # Config file (required)
   CONTEXT.md           # Optional context for the AI
   repo1/               # Git repository
   repo2/               # Git repository (can have 1 or more repos)
@@ -38,21 +38,23 @@ my-repos/
 
 ## Usage
 
+If you're running from source, replace `bye-bye-flag` with `pnpm start`.
+
 ```bash
 # Run the orchestrator - fetches stale flags and processes them
-pnpm start run --repos-dir=/path/to/my-repos
+bye-bye-flag run --repos-dir=/path/to/my-repos
 
 # Dry run to preview what would happen
-pnpm start run --repos-dir=/path/to/my-repos --dry-run
+bye-bye-flag run --repos-dir=/path/to/my-repos --dry-run
 
 # Find flags with no code references (quick wins to delete from PostHog)
-pnpm start run --repos-dir=/path/to/my-repos --max-prs=0
+bye-bye-flag run --repos-dir=/path/to/my-repos --max-prs=0
 
 # Process flags from a custom JSON file
-pnpm start run --repos-dir=/path/to/my-repos --input=my-flags.json
+bye-bye-flag run --repos-dir=/path/to/my-repos --input=my-flags.json
 
 # Remove a single flag manually (for testing)
-pnpm start remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/my-repos
+bye-bye-flag remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/my-repos
 ```
 
 ## Options
@@ -61,7 +63,7 @@ pnpm start remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/my
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--repos-dir=<path>` | (required) | Path to directory containing bye-bye-flag.json |
+| `--repos-dir=<path>` | (required) | Path to directory containing bye-bye-flag-config.json |
 | `--concurrency=<n>` | 2 | Max agents running in parallel |
 | `--max-prs=<n>` | 10 | Stop after creating this many PRs |
 | `--log-dir=<path>` | `./bye-bye-flag-logs` | Directory for agent logs |
@@ -74,13 +76,13 @@ pnpm start remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/my
 |--------|-------------|
 | `--flag=<key>` | The feature flag key to remove (required) |
 | `--keep=<branch>` | Which code path to keep: `enabled` or `disabled` (required) |
-| `--repos-dir=<path>` | Path to directory containing bye-bye-flag.json (required) |
+| `--repos-dir=<path>` | Path to directory containing bye-bye-flag-config.json (required) |
 | `--dry-run` | Preview changes without creating a PR |
 | `--keep-worktree` | Keep the worktree after completion for manual inspection |
 
 ### `test-setup` command (debug setup issues)
 
-Test your `bye-bye-flag.json` setup commands without running the full orchestrator:
+Test your `bye-bye-flag-config.json` setup commands without running the full orchestrator:
 
 ```bash
 # Test all repos
@@ -116,21 +118,27 @@ The tool is designed to be idempotent and safe to run multiple times:
 - **Open PRs block re-runs**: If a PR already exists for a flag, the tool will refuse to run and point you to the existing PR.
 - **Closed/merged PRs allow re-runs**: If a PR was merged or closed (without being declined), you can run the tool again to create a fresh PR.
 - **Declined PRs**: If a PR is closed because the flag removal was rejected, add `[DECLINED]` to the PR title. This prevents future removal attempts for that flag.
-- **Worktrees are preserved**: After creating a PR, the worktree is kept for resuming the Claude session. Worktrees are automatically cleaned up when their PR is merged or closed.
+- **Worktrees are preserved**: After creating a PR, the worktree is kept for resuming the agent session. Worktrees are automatically cleaned up when their PR is merged or closed.
 
 ### Resuming a Session
 
-If you need to make changes or continue working on a PR, the PR description includes a resume command:
+If you need to make changes or continue working on a PR, the PR description includes a resume command matching the configured agent:
 
 ```bash
+# Claude Code
 cd /tmp/bye-bye-flag-worktrees/remove-flag-my-flag && claude --resume <session-id>
+
+# Codex CLI
+cd /tmp/bye-bye-flag-worktrees/remove-flag-my-flag && codex resume <session-id>
 ```
 
-This lets you continue the Claude Code session with full context of what was already done.
+This lets you continue the agent session with full context of what was already done.
 
 ## Configuration
 
-Create a `bye-bye-flag.json` in your repos directory:
+Create a `bye-bye-flag-config.json` in your repos directory:
+
+Example files are available in `examples/`.
 
 ```json
 {
@@ -155,6 +163,21 @@ Create a `bye-bye-flag.json` in your repos directory:
 }
 ```
 
+### Agent Configuration
+
+- `agent.type`: Which agent CLI to use (`claude` or `codex`, default: `claude`)
+- `agent.args`: Extra CLI args appended to the agent invocation (optional)
+
+Example:
+```json
+{
+  "agent": {
+    "type": "codex",
+    "args": ["--model", "o3"]
+  }
+}
+```
+
 ### Fetcher Configuration
 
 - `fetcher.type`: Which fetcher to use (`posthog` or `manual`)
@@ -168,7 +191,7 @@ Create a `bye-bye-flag.json` in your repos directory:
 
 ### Repo Configuration
 
-- `shellInit` (optional): Default command to run before each shell command (setup and Claude)
+- `shellInit` (optional): Default command to run before each shell command (setup and agent)
 - `repos.<name>.shellInit` (optional): Override shellInit for a specific repo
 - `repos.<name>.mainSetup` (optional): Setup commands for the main repo (run once per orchestrator run)
 - `repos.<name>.setup`: Setup commands for worktrees (run per flag, supports `${MAIN_REPO}` substitution)
@@ -192,7 +215,7 @@ This avoids running `pnpm install` for every flag, significantly speeding up bat
 
 You can provide additional context to the agent by placing markdown files in your repos directory:
 
-- `CLAUDE.md` - Instructions for Claude (coding standards, patterns to follow)
+- `CLAUDE.md` - Agent instructions (coding standards, patterns to follow)
 - `CONTEXT.md` - General context about how the repositories relate
 
 These files are automatically included in the prompt.
@@ -213,6 +236,9 @@ POSTHOG_PROJECT_ID=12345
 
 # Or multiple projects (comma-separated, e.g., dev and prod):
 POSTHOG_PROJECT_IDS=12345,67890
+
+# Optional: PostHog host (default: https://app.posthog.com)
+# POSTHOG_HOST=https://app.posthog.com
 ```
 
 ## Fetching Stale Flags (PostHog)
@@ -314,6 +340,7 @@ Duration: 15m 30s
 Processed: 10 flags
 
   ✓ 10 PRs created
+  ○ 0 no changes needed
   ○ 3 no code references
   ✗ 0 failed
   ⊘ 1 skipped

@@ -38,7 +38,7 @@ export async function readContextFiles(dirPath: string): Promise<string> {
 }
 
 /**
- * Generates the prompt for Claude Code to remove a feature flag
+ * Generates the prompt for the configured agent to remove a feature flag
  */
 export async function generatePrompt(params: PromptParams): Promise<string> {
   const { flagKey, keepBranch, repoContext, globalContext } = params;

@@ -92,12 +92,18 @@ export async function fetchFlags(config: PostHogFetcherConfig): Promise<FlagToRe
   const flagsByProject = new Map<string, PostHogFlag[]>();
   let totalFlags = 0;
 
-  for (const projectId of projectIds) {
-    console.error(`  Fetching project ${projectId}...`);
-    const flags = await fetchFlagsForProject(projectId, apiKey, host);
+  const fetched = await Promise.all(
+    projectIds.map(async (projectId) => {
+      console.error(`  Fetching project ${projectId}...`);
+      const flags = await fetchFlagsForProject(projectId, apiKey, host);
+      console.error(`    Found ${flags.length} flags`);
+      return { projectId, flags };
+    })
+  );
+
+  for (const { projectId, flags } of fetched) {
     flagsByProject.set(projectId, flags);
     totalFlags += flags.length;
-    console.error(`    Found ${flags.length} flags`);
   }
 
   console.error(`Total: ${totalFlags} flags across ${projectIds.length} project(s)`);

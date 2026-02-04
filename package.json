@@ -2,11 +2,26 @@
   "name": "bye-bye-flag",
   "version": "0.1.0",
   "description": "Remove stale feature flags from codebases using AI",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RelevanceAI/bye-bye-flag.git"
+  },
   "type": "module",
+  "bin": {
+    "bye-bye-flag": "src/cli.ts"
+  },
+  "files": [
+    "src",
+    "prompts",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
-    "start": "node --env-file-if-exists=.env src/cli.ts",
-    "test-setup": "node --env-file-if-exists=.env src/test-setup.ts",
-    "fetch:posthog": "node --env-file-if-exists=.env src/fetchers/posthog/cli.ts",
+    "start": "node src/cli.ts",
+    "test-setup": "node src/test-setup.ts",
+    "fetch:posthog": "node src/fetchers/posthog/cli.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -1,12 +1,19 @@
 import { execa } from 'execa';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { z } from 'zod';
 import { CONFIG } from '../config.ts';
 import { consoleLogger, type Logger } from '../types.ts';
 
 export interface ScaffoldOptions {
-  reposDir: string; // Directory containing bye-bye-flag.json and repo subdirectories
+  reposDir: string; // Directory containing bye-bye-flag-config.json and repo subdirectories
   branchName: string;
+  /**
+   * If true, delete the remote branch on origin before recreating it locally.
+   * Useful for ensuring a "fresh" branch for PR creation, but should be disabled
+   * in dry-run mode to avoid network/destructive operations.
+   */
+  deleteRemoteBranch?: boolean;
   logger?: Logger; // Optional logger (defaults to console)
 }
 
@@ -20,13 +27,13 @@ export interface ScaffoldResult {
 }
 
 /**
- * Creates worktrees for all git repos configured in bye-bye-flag.json
+ * Creates worktrees for all git repos configured in bye-bye-flag-config.json
  * Returns a workspace root containing all worktrees
  */
 export async function setupMultiRepoWorktrees(
   options: ScaffoldOptions
 ): Promise<ScaffoldResult> {
-  const { reposDir, branchName, logger = consoleLogger } = options;
+  const { reposDir, branchName, deleteRemoteBranch = true, logger = consoleLogger } = options;
   const workspacePath = path.join(CONFIG.worktreeBasePath, branchName.replace(/\//g, '-'));
 
   // Ensure workspace path exists
@@ -37,7 +44,7 @@ export async function setupMultiRepoWorktrees(
   const configuredRepos = Object.keys(config.repos);
 
   if (configuredRepos.length === 0) {
-    throw new Error('No repos configured in bye-bye-flag.json');
+    throw new Error('No repos configured in bye-bye-flag-config.json');
   }
 
   // Validate each configured repo exists and is a git repo
@@ -79,7 +86,9 @@ export async function setupMultiRepoWorktrees(
     // Delete existing branch if it exists (local and remote) so we start fresh
     // Using reject: false so these won't throw even if branch doesn't exist
     await execa('git', ['branch', '-D', branchName], { cwd: repoPath, reject: false });
-    await execa('git', ['push', 'origin', '--delete', branchName], { cwd: repoPath, reject: false });
+    if (deleteRemoteBranch) {
+      await execa('git', ['push', 'origin', '--delete', branchName], { cwd: repoPath, reject: false });
+    }
 
     // Get default branch (already fetched in removeFlag before scaffolding)
     const defaultBranch = await getDefaultBranch(repoPath);
@@ -163,38 +172,110 @@ export async function getDefaultBranch(repoPath: string): Promise<string> {
   }
 }
 
-interface RepoEntry {
-  shellInit?: string; // Override shell init for this repo
-  mainSetup?: string[]; // Setup commands for main repo (run once by orchestrator)
-  setup: string[]; // Setup commands for worktrees (run per flag)
-}
+const RepoEntrySchema = z
+  .object({
+    shellInit: z.string().optional(), // Override shell init for this repo
+    mainSetup: z.array(z.string()).optional(), // Setup commands for main repo (run once by orchestrator)
+    setup: z.array(z.string()), // Setup commands for worktrees (run per flag)
+  })
+  .strict();
 
-interface ReposConfig {
-  shellInit?: string; // Default command to run before each shell command
-  repos: Record<string, RepoEntry>;
-}
+const OrchestratorSettingsSchema = z
+  .object({
+    concurrency: z.number().int().positive().optional(),
+    maxPrs: z.number().int().nonnegative().optional(),
+    logDir: z.string().optional(),
+  })
+  .strict();
 
-let cachedConfig: ReposConfig | null = null;
+const FetcherConfigSchema = z.discriminatedUnion('type', [
+  z
+    .object({
+      type: z.literal('posthog'),
+      staleDays: z.number().int().positive().optional(),
+      host: z.string().optional(),
+    })
+    .strict(),
+  z.object({ type: z.literal('manual') }).strict(),
+]);
+
+const AgentConfigSchema = z.discriminatedUnion('type', [
+  z
+    .object({
+      type: z.literal('claude'),
+      /**
+       * Extra CLI args appended to the invocation (for example: model selection).
+       * Do not include the prompt/session flags; those are managed by bye-bye-flag.
+       */
+      args: z.array(z.string()).optional(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('codex'),
+      /**
+       * Extra CLI args appended to the invocation (for example: model/profile selection).
+       * Do not include the prompt/session flags; those are managed by bye-bye-flag.
+       */
+      args: z.array(z.string()).optional(),
+    })
+    .strict(),
+]);
+
+const ByeByeFlagConfigSchema = z
+  .object({
+    fetcher: FetcherConfigSchema.optional(),
+    agent: AgentConfigSchema.optional(),
+    orchestrator: OrchestratorSettingsSchema.optional(),
+    shellInit: z.string().optional(), // Default command to run before each shell command
+    repos: z.record(RepoEntrySchema),
+  })
+  .strict();
+
+export type ByeByeFlagConfig = z.infer<typeof ByeByeFlagConfigSchema>;
+
+let cachedConfig: ByeByeFlagConfig | null = null;
 let cachedConfigPath: string | null = null;
 
 /**
- * Reads bye-bye-flag.json from the repos root directory
+ * Reads bye-bye-flag-config.json from the repos root directory
  * Throws if config file is missing
  */
-export async function readConfig(reposDir: string): Promise<ReposConfig> {
-  const configPath = path.join(reposDir, 'bye-bye-flag.json');
+const CONFIG_FILENAME = 'bye-bye-flag-config.json';
 
-  if (cachedConfig && cachedConfigPath === configPath) {
+export async function readConfig(reposDir: string): Promise<ByeByeFlagConfig> {
+  const preferredPath = path.join(reposDir, CONFIG_FILENAME);
+
+  if (cachedConfig && cachedConfigPath === preferredPath) {
     return cachedConfig;
   }
 
+  let content: string;
+
   try {
-    const content = await fs.readFile(configPath, 'utf-8');
-    cachedConfig = JSON.parse(content);
-    cachedConfigPath = configPath;
-    return cachedConfig!;
-  } catch {
-    throw new Error(`Missing required config file: ${configPath}`);
+    content = await fs.readFile(preferredPath, 'utf-8');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    if (code !== 'ENOENT') {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(`Failed to read config file: ${preferredPath}\n${message}`);
+    }
+    throw new Error(`Missing required config file: ${preferredPath}`);
+  }
+
+  try {
+    const parsed = ByeByeFlagConfigSchema.parse(JSON.parse(content));
+    cachedConfig = parsed;
+    cachedConfigPath = preferredPath;
+    return cachedConfig;
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      const issues = error.issues
+        .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
+        .join('\n');
+      throw new Error(`Invalid config file: ${preferredPath}\n${issues}`);
+    }
+    throw error;
   }
 }
 
@@ -211,7 +292,7 @@ export async function getShellInit(reposDir: string, repoName?: string): Promise
 
 /**
  * Runs setup commands for a repo
- * Requires bye-bye-flag.json with an entry for this repo
+ * Requires bye-bye-flag-config.json with an entry for this repo
  * Supports ${MAIN_REPO} substitution to reference the main repo path
  */
 async function runSetupCommands(
@@ -226,7 +307,7 @@ async function runSetupCommands(
 
   const repoConfig = config.repos[repoName];
   if (!repoConfig) {
-    throw new Error(`No config entry for repo "${repoName}" in bye-bye-flag.json`);
+    throw new Error(`No config entry for repo "${repoName}" in bye-bye-flag-config.json`);
   }
 
   // Per-repo shellInit takes precedence over default
@@ -246,7 +327,20 @@ async function runSetupCommands(
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Setup command "${cmd}" failed in ${repoName}: ${message}`);
+      const stdout = typeof (error as { stdout?: unknown }).stdout === 'string' ? (error as { stdout: string }).stdout : '';
+      const stderr = typeof (error as { stderr?: unknown }).stderr === 'string' ? (error as { stderr: string }).stderr : '';
+
+      const outputParts = [
+        stdout.trim() ? `stdout:\n${stdout.trimEnd()}` : '',
+        stderr.trim() ? `stderr:\n${stderr.trimEnd()}` : '',
+      ].filter(Boolean);
+
+      const output = outputParts.join('\n\n');
+      const clippedOutput = output.length > 4000 ? output.slice(0, 4000) + '\n… (truncated)' : output;
+
+      throw new Error(
+        `Setup command "${cmd}" failed in ${repoName}: ${message}` + (clippedOutput ? `\n\n${clippedOutput}` : '')
+      );
     }
   }
 }

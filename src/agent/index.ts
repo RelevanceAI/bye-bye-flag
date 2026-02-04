@@ -2,7 +2,7 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { execa } from 'execa';
 import { CONFIG } from '../config.ts';
-import type { RemovalRequest, RemovalResult, RepoResult } from '../types.ts';
+import { consoleLogger, type Logger, type RemovalRequest, type RemovalResult, type RepoResult } from '../types.ts';
 import {
   setupMultiRepoWorktrees,
   cleanupMultiRepoWorktrees,
@@ -12,75 +12,11 @@ import {
 } from './scaffold.ts';
 import { generatePrompt, readContextFiles } from './prompt.ts';
 import { invokeClaudeCode } from './invoke.ts';
-import { commitAndPushMultiRepo, hasChanges, showDiff, findExistingPR, type ExistingPR } from './git.ts';
+import { commitAndPushMultiRepo, hasChanges, showDiff } from './git.ts';
 import { getSessionId } from './invoke.ts';
 
-/**
- * Cleans up worktrees for flags whose PRs have been merged or closed
- * Called at the start of each run to garbage collect old worktrees
- */
-async function cleanupStaleWorktrees(reposDir: string): Promise<void> {
-  try {
-    const entries = await fs.readdir(CONFIG.worktreeBasePath, { withFileTypes: true });
-    const worktreeDirs = entries.filter(
-      (e) => e.isDirectory() && e.name.startsWith('remove-flag-')
-    );
-
-    if (worktreeDirs.length === 0) return;
-
-    console.log(`Checking ${worktreeDirs.length} existing worktree(s) for cleanup...`);
-
-    const config = await readConfig(reposDir);
-    const repoNames = Object.keys(config.repos);
-
-    for (const dir of worktreeDirs) {
-      // Extract flag key from directory name (remove-flag-{flagKey})
-      const flagKey = dir.name.replace('remove-flag-', '');
-      const workspacePath = path.join(CONFIG.worktreeBasePath, dir.name);
-
-      // Check if any repo still has an open PR for this flag
-      let hasOpenPR = false;
-      for (const repoName of repoNames) {
-        const repoPath = path.join(reposDir, repoName);
-        try {
-          const existingPR = await findExistingPR(repoPath, flagKey);
-          if (existingPR && existingPR.state === 'OPEN') {
-            hasOpenPR = true;
-            break;
-          }
-        } catch {
-          // Skip repos we can't check
-        }
-      }
-
-      if (!hasOpenPR) {
-        console.log(`  Cleaning up worktree for "${flagKey}" (PR merged/closed or not found)`);
-        try {
-          // Clean up each repo's worktree
-          for (const repoName of repoNames) {
-            const repoPath = path.join(reposDir, repoName);
-            const worktreePath = path.join(workspacePath, repoName);
-            try {
-              await execa('git', ['worktree', 'remove', worktreePath, '--force'], {
-                cwd: repoPath,
-                reject: false,
-              });
-            } catch {
-              // Ignore errors
-            }
-          }
-          // Remove the workspace directory
-          await fs.rm(workspacePath, { recursive: true, force: true });
-        } catch {
-          // Ignore cleanup errors
-        }
-      } else {
-        console.log(`  Keeping worktree for "${flagKey}" (PR still open)`);
-      }
-    }
-  } catch {
-    // worktreeBasePath doesn't exist yet, nothing to clean up
-  }
+export interface RemoveFlagOptions extends RemovalRequest {
+  logger?: Logger; // Optional logger (defaults to console)
 }
 
 /**
@@ -197,101 +133,50 @@ async function checkPrerequisites(request: RemovalRequest): Promise<string[]> {
  * Main entry point for the removal agent
  * Operates on a directory containing bye-bye-flag.json and one or more git repos
  */
-export async function removeFlag(request: RemovalRequest): Promise<RemovalResult> {
-  const { flagKey, keepBranch, reposDir, dryRun, keepWorktree } = request;
+export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalResult> {
+  const { flagKey, keepBranch, reposDir, dryRun, keepWorktree, logger = consoleLogger } = options;
   const branchName = `${CONFIG.branchPrefix}${flagKey}`;
 
   // Check prerequisites first
-  console.log('Checking prerequisites...');
-  const errors = await checkPrerequisites(request);
+  logger.log('Checking prerequisites...');
+  const errors = await checkPrerequisites(options);
   if (errors.length > 0) {
-    console.error('\nPrerequisite check failed:');
-    errors.forEach((e) => console.error(`  - ${e}`));
+    logger.error('Prerequisite check failed:');
+    errors.forEach((e) => logger.error(`  - ${e}`));
     return {
       status: 'failed',
       error: `Prerequisites not met: ${errors.join('; ')}`,
     };
   }
-  console.log('Prerequisites OK\n');
+  logger.log('Prerequisites OK');
 
-  console.log(`\n${'='.repeat(60)}`);
-  console.log(`Removing flag: ${flagKey} (keep: ${keepBranch})`);
-  console.log(`Repos directory: ${reposDir}`);
-  console.log(`${'='.repeat(60)}\n`);
-
-  // Clean up worktrees from previous runs whose PRs have been merged/closed
-  if (!dryRun) {
-    await cleanupStaleWorktrees(reposDir);
-  }
+  logger.log(`${'='.repeat(60)}`);
+  logger.log(`Removing flag: ${flagKey} (keep: ${keepBranch})`);
+  logger.log(`Repos directory: ${reposDir}`);
+  logger.log(`${'='.repeat(60)}`);
 
   // Fetch latest from all repos before checking for flag
-  console.log('\nFetching latest from origin...');
-  await fetchAllRepos(reposDir);
+  // TODO: Revisit - should we always skip these checks? Depends on whether we need standalone agent usage
+  // When called from orchestrator, skipFetch=true and these checks are already done at orchestrator level
+  if (!options.skipFetch) {
+    logger.log('Fetching latest from origin...');
+    await fetchAllRepos(reposDir);
 
-  // Check if flag exists in any repo BEFORE scaffolding (saves time if flag not found)
-  console.log(`\nChecking if flag "${flagKey}" exists in codebase...`);
-  const flagExists = await flagExistsInCodebase(reposDir, flagKey);
-  if (!flagExists) {
-    console.log(`Flag "${flagKey}" not found in any repository. Safe to remove from feature flag system.`);
-    return {
-      status: 'success',
-      summary: `Flag "${flagKey}" was not found anywhere in the codebase. It can be safely removed from the feature flag system.`,
-      filesChanged: [],
-      branchName,
-    };
-  }
-  // Check for existing PRs before doing expensive work (skip in dry-run since gh may not be available)
-  if (!dryRun) {
-    console.log(`Flag found. Checking for existing PRs...`);
-
-    const config = await readConfig(reposDir);
-    const repoNames = Object.keys(config.repos);
-    const existingPRs: Array<{ repo: string; pr: ExistingPR }> = [];
-
-    for (const repoName of repoNames) {
-      const repoPath = path.join(reposDir, repoName);
-      const existingPR = await findExistingPR(repoPath, flagKey);
-      if (existingPR) {
-        existingPRs.push({ repo: repoName, pr: existingPR });
-      }
-    }
-
-    // Block on OPEN PRs or DECLINED PRs (title contains [DECLINED])
-    const openPRs = existingPRs.filter(({ pr }) => pr.state === 'OPEN');
-    const declinedPRs = existingPRs.filter(({ pr }) => pr.declined);
-
-    if (declinedPRs.length > 0) {
-      console.log(`\nFound declined PR(s) for flag "${flagKey}":`);
-      declinedPRs.forEach(({ repo, pr }) => console.log(`  - ${repo}: ${pr.url}`));
-      console.log('\nThis flag removal was previously declined. Skipping.');
-      console.log('To retry, remove [DECLINED] from the PR title.');
+    // Check if flag exists in any repo BEFORE scaffolding (saves time if flag not found)
+    logger.log(`Checking if flag "${flagKey}" exists in codebase...`);
+    const flagExists = await flagExistsInCodebase(reposDir, flagKey);
+    if (!flagExists) {
+      logger.log(`Flag "${flagKey}" not found in any repository. Safe to remove from feature flag system.`);
       return {
-        status: 'refused',
-        refusalReason: `Flag removal was declined: ${declinedPRs.map((p) => p.pr.url).join(', ')}`,
+        status: 'success',
+        summary: `Flag "${flagKey}" was not found anywhere in the codebase. It can be safely removed from the feature flag system.`,
+        filesChanged: [],
         branchName,
       };
     }
-
-    if (openPRs.length > 0) {
-      console.log(`\nFound open PR(s) for flag "${flagKey}":`);
-      openPRs.forEach(({ repo, pr }) => console.log(`  - ${repo}: ${pr.url}`));
-      console.log('\nSkipping to avoid duplicate work. Close or merge existing PRs first.');
-      console.log('To resume the session, see the PR description for the resume command.');
-      return {
-        status: 'refused',
-        refusalReason: `Open PR already exists for this flag: ${openPRs.map((p) => p.pr.url).join(', ')}`,
-        branchName,
-      };
-    }
-
-    if (existingPRs.length > 0) {
-      console.log(`Found ${existingPRs.length} closed/merged PR(s) for this flag. Creating new PR...`);
-    } else {
-      console.log(`No existing PRs found.`);
-    }
   }
 
-  console.log(`Setting up worktrees...`);
+  logger.log(`Setting up worktrees...`);
 
   let scaffoldResult: ScaffoldResult | null = null;
   let repoResults: RepoResult[] | undefined = undefined;
@@ -301,6 +186,7 @@ export async function removeFlag(request: RemovalRequest): Promise<RemovalResult
     scaffoldResult = await setupMultiRepoWorktrees({
       reposDir,
       branchName,
+      logger,
     });
 
     if (scaffoldResult.repos.length === 0) {
@@ -311,10 +197,10 @@ export async function removeFlag(request: RemovalRequest): Promise<RemovalResult
       };
     }
 
-    console.log(`\nFound ${scaffoldResult.repos.length} repos:`);
-    scaffoldResult.repos.forEach((r) => console.log(`  - ${r.name}`));
+    logger.log(`Found ${scaffoldResult.repos.length} repos:`);
+    scaffoldResult.repos.forEach((r) => logger.log(`  - ${r.name}`));
 
-    console.log(`\nLaunching Claude Code to remove the flag...`);
+    logger.log(`Launching Claude Code to remove the flag...`);
 
     // Generate session ID for this run (used for resume capability)
     const sessionId = getSessionId(branchName);
@@ -335,11 +221,12 @@ export async function removeFlag(request: RemovalRequest): Promise<RemovalResult
       prompt,
       reposDir,
       undefined,
-      sessionId
+      sessionId,
+      logger
     );
 
     if (agentOutput.status === 'refused') {
-      console.log(`\nAgent refused: ${agentOutput.summary}`);
+      logger.log(`Agent refused: ${agentOutput.summary}`);
       return {
         status: 'refused',
         refusalReason: agentOutput.summary,
@@ -348,21 +235,21 @@ export async function removeFlag(request: RemovalRequest): Promise<RemovalResult
     }
 
     if (dryRun) {
-      console.log('\n--- DRY RUN MODE ---');
-      console.log('Agent completed successfully.');
-      console.log(`Summary: ${agentOutput.summary}`);
-      console.log(`Files changed: ${agentOutput.filesChanged.join(', ')}`);
+      logger.log('--- DRY RUN MODE ---');
+      logger.log('Agent completed successfully.');
+      logger.log(`Summary: ${agentOutput.summary}`);
+      logger.log(`Files changed: ${agentOutput.filesChanged.join(', ')}`);
 
       // Show which repos have changes
-      console.log('\nRepos with changes:');
+      logger.log('Repos with changes:');
       for (const repo of scaffoldResult.repos) {
         const changed = await hasChanges(repo.worktreePath);
-        console.log(`  ${repo.name}: ${changed ? 'HAS CHANGES' : 'no changes'}`);
+        logger.log(`  ${repo.name}: ${changed ? 'HAS CHANGES' : 'no changes'}`);
         if (changed) {
           const diff = await showDiff(repo.worktreePath);
-          console.log(`\n--- ${repo.name} DIFF ---`);
-          console.log(diff);
-          console.log(`--- END ${repo.name} DIFF ---\n`);
+          logger.log(`--- ${repo.name} DIFF ---`);
+          logger.log(diff);
+          logger.log(`--- END ${repo.name} DIFF ---`);
         }
       }
 
@@ -375,7 +262,7 @@ export async function removeFlag(request: RemovalRequest): Promise<RemovalResult
     }
 
     // Commit and create PRs for each repo with changes
-    console.log('\nCommitting and creating PRs...');
+    logger.log('Committing and creating PRs...');
     repoResults = await commitAndPushMultiRepo(
       scaffoldResult.repos,
       branchName,
@@ -389,7 +276,7 @@ export async function removeFlag(request: RemovalRequest): Promise<RemovalResult
     const successCount = repoResults.filter((r) => r.status === 'success').length;
     const noChangesCount = repoResults.filter((r) => r.status === 'no-changes').length;
 
-    console.log(`\nResults: ${successCount} PRs created, ${noChangesCount} repos unchanged`);
+    logger.log(`Results: ${successCount} PRs created, ${noChangesCount} repos unchanged`);
 
     return {
       status: 'success',
@@ -400,7 +287,7 @@ export async function removeFlag(request: RemovalRequest): Promise<RemovalResult
     };
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    console.error(`\nError removing flag: ${errorMessage}`);
+    logger.error(`Error removing flag: ${errorMessage}`);
 
     return {
       status: 'failed',
@@ -419,10 +306,10 @@ export async function removeFlag(request: RemovalRequest): Promise<RemovalResult
       const shouldKeep = keepWorktree || prCreated;
 
       if (shouldKeep) {
-        console.log(`\nWorktree preserved at: ${scaffoldResult.workspacePath}`);
-        console.log('The worktree will be automatically cleaned up when the PR is merged or closed.');
-        console.log('To resume, see the PR description for the Claude --resume command.');
-        console.log('To cleanup manually: rm -rf ' + scaffoldResult.workspacePath);
+        logger.log(`Worktree preserved at: ${scaffoldResult.workspacePath}`);
+        logger.log('The worktree will be automatically cleaned up when the PR is merged or closed.');
+        logger.log('To resume, see the PR description for the Claude --resume command.');
+        logger.log('To cleanup manually: rm -rf ' + scaffoldResult.workspacePath);
       } else {
         await cleanupMultiRepoWorktrees(scaffoldResult);
       }

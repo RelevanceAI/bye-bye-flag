@@ -39,25 +39,64 @@ my-repos/
 ## Usage
 
 ```bash
-# Remove a flag, keeping the enabled code path
+# Run the orchestrator - fetches stale flags and processes them
+pnpm start run --repos-dir=/path/to/my-repos
+
+# Dry run to preview what would happen
+pnpm start run --repos-dir=/path/to/my-repos --dry-run
+
+# Find flags with no code references (quick wins to delete from PostHog)
+pnpm start run --repos-dir=/path/to/my-repos --max-prs=0
+
+# Process flags from a custom JSON file
+pnpm start run --repos-dir=/path/to/my-repos --input=my-flags.json
+
+# Remove a single flag manually (for testing)
 pnpm start remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/my-repos
-
-# Dry run to preview changes without creating a PR
-pnpm start remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/my-repos --dry-run
-
-# Dry run with worktree preserved for manual inspection
-pnpm start remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/my-repos --dry-run --keep-worktree
 ```
 
 ## Options
+
+### `run` command (main command)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--repos-dir=<path>` | (required) | Path to directory containing bye-bye-flag.json |
+| `--concurrency=<n>` | 2 | Max agents running in parallel |
+| `--max-prs=<n>` | 10 | Stop after creating this many PRs |
+| `--log-dir=<path>` | `./bye-bye-flag-logs` | Directory for agent logs |
+| `--input=<file>` | (fetcher) | Use a JSON file instead of fetcher |
+| `--dry-run` | false | Run agents in dry-run mode (no PRs) |
+
+### `remove` command (single flag)
 
 | Option | Description |
 |--------|-------------|
 | `--flag=<key>` | The feature flag key to remove (required) |
 | `--keep=<branch>` | Which code path to keep: `enabled` or `disabled` (required) |
-| `--repos-dir=<path>` | Path to directory containing bye-bye-flag.json and repo subdirectories (required) |
+| `--repos-dir=<path>` | Path to directory containing bye-bye-flag.json (required) |
 | `--dry-run` | Preview changes without creating a PR |
 | `--keep-worktree` | Keep the worktree after completion for manual inspection |
+
+### `test-setup` command (debug setup issues)
+
+Test your `bye-bye-flag.json` setup commands without running the full orchestrator:
+
+```bash
+# Test all repos
+pnpm test-setup --repos-dir=/path/to/my-repos
+
+# Test a specific repo
+pnpm test-setup --repos-dir=/path/to/my-repos --repo=my-api
+
+# Test only worktree setup (skip mainSetup)
+pnpm test-setup --repos-dir=/path/to/my-repos --skip-main-setup
+
+# Test only mainSetup (skip worktree creation)
+pnpm test-setup --repos-dir=/path/to/my-repos --skip-worktree
+```
+
+This creates a temporary worktree, runs your setup commands, and cleans up. Useful for debugging setup failures.
 
 ## How It Works
 
@@ -95,6 +134,14 @@ Create a `bye-bye-flag.json` in your repos directory:
 
 ```json
 {
+  "fetcher": {
+    "type": "posthog",
+    "staleDays": 30
+  },
+  "orchestrator": {
+    "concurrency": 2,
+    "maxPrs": 10
+  },
   "shellInit": "source ~/.nvm/nvm.sh && nvm use",
   "repos": {
     "my-api": {
@@ -108,9 +155,38 @@ Create a `bye-bye-flag.json` in your repos directory:
 }
 ```
 
+### Fetcher Configuration
+
+- `fetcher.type`: Which fetcher to use (`posthog` or `manual`)
+- `fetcher.staleDays`: Days since last update to consider a flag stale (default: 30)
+
+### Orchestrator Configuration
+
+- `orchestrator.concurrency`: Max agents running in parallel (default: 2)
+- `orchestrator.maxPrs`: Stop after creating this many PRs (default: 10)
+- `orchestrator.logDir`: Directory for agent logs (default: `./bye-bye-flag-logs`)
+
+### Repo Configuration
+
 - `shellInit` (optional): Default command to run before each shell command (setup and Claude)
 - `repos.<name>.shellInit` (optional): Override shellInit for a specific repo
-- `repos.<name>.setup`: Setup commands for the repo (can chain with `&&` for commands that need to run in sequence)
+- `repos.<name>.mainSetup` (optional): Setup commands for the main repo (run once per orchestrator run)
+- `repos.<name>.setup`: Setup commands for worktrees (run per flag, supports `${MAIN_REPO}` substitution)
+
+**Optimization tip:** Use `mainSetup` to run `pnpm install` once on the main repo, then use `setup` to copy/link node_modules to worktrees:
+
+```json
+{
+  "repos": {
+    "my-repo": {
+      "mainSetup": ["pnpm install"],
+      "setup": ["cp -al ${MAIN_REPO}/node_modules ./node_modules"]
+    }
+  }
+}
+```
+
+This avoids running `pnpm install` for every flag, significantly speeding up batch processing.
 
 ## Context Files
 
@@ -186,47 +262,75 @@ This can be piped to other tools or used to drive the removal agent.
 ## Example Output
 
 ```
-Checking prerequisites...
-Prerequisites OK
-
-============================================================
-Removing flag: enable-new-dashboard (keep: enabled)
+════════════════════════════════════════════════════════════
+                    bye-bye-flag Orchestrator
+════════════════════════════════════════════════════════════
 Repos directory: ./my-repos
-============================================================
+Concurrency: 2
+Max PRs: 10
+Dry run: false
+════════════════════════════════════════════════════════════
 
-Fetching latest from origin for my-api...
-Creating worktree for my-api on branch remove-flag/enable-new-dashboard...
-  Running: pnpm install
-  Running: pnpm run codegen
+Logs: ./bye-bye-flag-logs/2024-01-15T10-30-00
 
-Fetching latest from origin for my-frontend...
-Creating worktree for my-frontend on branch remove-flag/enable-new-dashboard...
-  Running: pnpm install
+Fetching latest from origin...
+  Fetching my-api...
+  Fetching my-frontend...
 
-Workspace created at /tmp/bye-bye-flag-worktrees/remove-flag-enable-new-dashboard with 2 repos
+Running main setup on repos...
+  my-api:
+    Running: pnpm install
 
-Found 2 repos:
-  - my-api
-  - my-frontend
+Fetching stale flags...
+Fetched 25 stale flags
 
-Checking if flag "enable-new-dashboard" exists in codebase...
-Flag found. Launching Claude Code to remove it...
+Checking for existing PRs...
+  Fetching PRs from my-api...
+    Found 3 bye-bye-flag PRs
+  Fetching PRs from my-frontend...
+    Found 2 bye-bye-flag PRs
+  ⊘ old-feature: Open PR exists (skipping)
+  15 flags passed PR check (1 skipped)
 
-[Claude] Searching for flag usages...
-[Claude] Removing flag from my-frontend/src/components/Dashboard.tsx...
+Checking for code references...
+  ○ unused-flag: No code references
+  12 flags have code references (3 have no code)
+
+Processing up to 10 PRs with concurrency 2...
+
+▶ Starting: enable-dashboard (0/10 PRs)
+    Keep: enabled | Worktree: /tmp/bye-bye-flag-worktrees/remove-flag-enable-dashboard
+▶ Starting: new-feature (0/10 PRs)
+    Keep: enabled | Worktree: /tmp/bye-bye-flag-worktrees/remove-flag-new-feature
+✓ Complete: enable-dashboard (1 PR(s), 1/10 total, 2m 15s)
+✓ Complete: new-feature (2 PR(s), 3/10 total, 3m 42s)
 ...
 
---- RESULT ---
-{
-  "status": "success",
-  "branchName": "remove-flag/enable-new-dashboard",
-  "summary": "Removed enable-new-dashboard flag from 3 files",
-  "filesChanged": ["my-frontend/src/components/Dashboard.tsx", "my-frontend/src/hooks/useFeatures.ts"],
-  "repoResults": [
-    { "repoName": "my-frontend", "status": "success", "prUrl": "https://github.com/org/my-frontend/pull/123" },
-    { "repoName": "my-api", "status": "no-changes" }
-  ]
-}
+════════════════════════════════════════════════════════════
+                    bye-bye-flag Run Complete
+════════════════════════════════════════════════════════════
+Fetcher: posthog (found 25 stale flags)
+Duration: 15m 30s
+Processed: 10 flags
+
+  ✓ 10 PRs created
+  ○ 3 no code references
+  ✗ 0 failed
+  ⊘ 1 skipped
+  … 11 remaining (--max-prs limit)
+
+PRs created:
+  • enable-dashboard: https://github.com/org/my-frontend/pull/123
+  • new-feature: https://github.com/org/my-api/pull/456
+  • new-feature: https://github.com/org/my-frontend/pull/457
+  ...
+
+Skipped:
+  • old-feature: Open PR: https://github.com/org/my-frontend/pull/100
+
+Logs: ./bye-bye-flag-logs/2024-01-15T10-30-00
+
+To continue processing remaining flags, run the command again.
 ```
 
 ## License

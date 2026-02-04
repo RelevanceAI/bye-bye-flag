@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "start": "node --env-file-if-exists=.env src/cli.ts",
-    "fetch:posthog": "node --env-file-if-exists=.env src/fetchers/posthog.ts",
+    "test-setup": "node --env-file-if-exists=.env src/test-setup.ts",
+    "fetch:posthog": "node --env-file-if-exists=.env src/fetchers/posthog/cli.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

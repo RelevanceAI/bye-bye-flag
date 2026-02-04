@@ -1,42 +1,25 @@
-#!/usr/bin/env npx tsx
 /**
  * PostHog Feature Flags Fetcher
  *
  * Fetches stale feature flags from PostHog that are candidates for removal.
  *
  * Criteria for stale flags:
- * - updated_at > 30 days ago
+ * - updated_at > staleDays ago (default: 30)
  * - Either 0% or 100% rollout (no complex targeting)
  * - No payload
- *
- * Multi-project support:
- * - Set POSTHOG_PROJECT_IDS as comma-separated list (e.g., "12345,67890")
- * - A flag is only considered stale if it meets criteria in ALL projects where it exists
- *
- * Output: JSON array of flags to remove (to stdout)
- * [
- *   { "key": "my-flag", "keepBranch": "enabled", "reason": "100% rollout for 45 days" },
- *   ...
- * ]
- *
- * Usage:
- *   npx tsx src/fetchers/posthog.ts
- *   npx tsx src/fetchers/posthog.ts --stale-days=60
- *   npx tsx src/fetchers/posthog.ts --show-all  # Show all flags, not just stale ones
+ * - No multivariate variants
+ * - If flag exists in multiple projects, must be consistent across all
  */
 
-// Environment variables loaded via Node's --env-file-if-exists flag (gracefully handles missing .env files)
+import type { FlagToRemove, PostHogFetcherConfig } from '../types.ts';
 
-// Configuration
-const POSTHOG_API_KEY = process.env.POSTHOG_API_KEY;
-const POSTHOG_PROJECT_IDS = (process.env.POSTHOG_PROJECT_IDS || process.env.POSTHOG_PROJECT_ID || '')
-  .split(',')
-  .map((id) => id.trim())
-  .filter(Boolean);
-const POSTHOG_HOST = process.env.POSTHOG_HOST || 'https://app.posthog.com';
-
-// Default: 30 days
-const DEFAULT_STALE_DAYS = 30;
+// PostHog API types
+interface PostHogUser {
+  id: number;
+  email: string;
+  first_name?: string;
+  last_name?: string;
+}
 
 interface PostHogFlag {
   id: number;
@@ -46,6 +29,7 @@ interface PostHogFlag {
   deleted: boolean;
   created_at: string;
   updated_at: string;
+  created_by: PostHogUser | null;
   status: string;
   filters: {
     groups?: Array<{
@@ -75,36 +59,78 @@ interface FlagInfo {
   hasVariants: boolean;
   active: boolean;
   deleted: boolean;
+  createdBy: string | null;
 }
 
-interface StaleFlag {
-  key: string;
-  keepBranch: 'enabled' | 'disabled';
-  reason: string;
-  lastModified: string;
-  rolloutPercentage: number;
-  projects: string[];
-}
+// Default: 30 days
+const DEFAULT_STALE_DAYS = 30;
 
-async function fetchFlagsForProject(projectId: string): Promise<PostHogFlag[]> {
-  if (!POSTHOG_API_KEY) {
+/**
+ * Fetches stale flags from PostHog
+ */
+export async function fetchFlags(config: PostHogFetcherConfig): Promise<FlagToRemove[]> {
+  const apiKey = process.env.POSTHOG_API_KEY;
+  const projectIds = (process.env.POSTHOG_PROJECT_IDS || process.env.POSTHOG_PROJECT_ID || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+  const host = config.host || process.env.POSTHOG_HOST || 'https://app.posthog.com';
+  const staleDays = config.staleDays ?? DEFAULT_STALE_DAYS;
+
+  if (!apiKey) {
     throw new Error('Missing POSTHOG_API_KEY environment variable');
   }
 
+  if (projectIds.length === 0) {
+    throw new Error('Missing POSTHOG_PROJECT_IDS or POSTHOG_PROJECT_ID environment variable');
+  }
+
+  console.error(`Fetching feature flags from PostHog...`);
+  console.error(`Projects: ${projectIds.join(', ')}`);
+
+  // Fetch flags from all projects
+  const flagsByProject = new Map<string, PostHogFlag[]>();
+  let totalFlags = 0;
+
+  for (const projectId of projectIds) {
+    console.error(`  Fetching project ${projectId}...`);
+    const flags = await fetchFlagsForProject(projectId, apiKey, host);
+    flagsByProject.set(projectId, flags);
+    totalFlags += flags.length;
+    console.error(`    Found ${flags.length} flags`);
+  }
+
+  console.error(`Total: ${totalFlags} flags across ${projectIds.length} project(s)`);
+
+  const staleFlags = analyzeFlagsAcrossProjects(flagsByProject, staleDays);
+  console.error(
+    `\nFound ${staleFlags.length} stale flags (>${staleDays} days, 0% or 100% rollout, no payload, consistent across projects)`
+  );
+
+  return staleFlags;
+}
+
+async function fetchFlagsForProject(
+  projectId: string,
+  apiKey: string,
+  host: string
+): Promise<PostHogFlag[]> {
   const allFlags: PostHogFlag[] = [];
-  let url: string | null = `${POSTHOG_HOST}/api/projects/${projectId}/feature_flags/`;
+  let url: string | null = `${host}/api/projects/${projectId}/feature_flags/`;
 
   while (url) {
     const response = await fetch(url, {
       headers: {
-        Authorization: `Bearer ${POSTHOG_API_KEY}`,
+        Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
     });
 
     if (!response.ok) {
       const text = await response.text();
-      throw new Error(`PostHog API error for project ${projectId}: ${response.status} ${response.statusText}\n${text}`);
+      throw new Error(
+        `PostHog API error for project ${projectId}: ${response.status} ${response.statusText}\n${text}`
+      );
     }
 
     const data: PostHogResponse = await response.json();
@@ -152,7 +178,7 @@ function hasVariants(flag: PostHogFlag): boolean {
 function analyzeFlagsAcrossProjects(
   flagsByProject: Map<string, PostHogFlag[]>,
   staleDays: number
-): StaleFlag[] {
+): FlagToRemove[] {
   const now = new Date();
   const staleThreshold = new Date(now.getTime() - staleDays * 24 * 60 * 60 * 1000);
 
@@ -161,6 +187,17 @@ function analyzeFlagsAcrossProjects(
 
   for (const [projectId, flags] of flagsByProject) {
     for (const flag of flags) {
+      // Format creator name (prefer "First Last", fallback to email)
+      let createdBy: string | null = null;
+      if (flag.created_by) {
+        const { first_name, last_name, email } = flag.created_by;
+        if (first_name || last_name) {
+          createdBy = [first_name, last_name].filter(Boolean).join(' ');
+        } else {
+          createdBy = email;
+        }
+      }
+
       const info: FlagInfo = {
         key: flag.key,
         projectId,
@@ -170,6 +207,7 @@ function analyzeFlagsAcrossProjects(
         hasVariants: hasVariants(flag),
         active: flag.active,
         deleted: flag.deleted,
+        createdBy,
       };
 
       const existing = flagsByKey.get(flag.key) || [];
@@ -179,7 +217,7 @@ function analyzeFlagsAcrossProjects(
   }
 
   // Find flags that are stale in ALL projects where they exist
-  const staleFlags: StaleFlag[] = [];
+  const staleFlags: FlagToRemove[] = [];
 
   for (const [key, infos] of flagsByKey) {
     // Check if ALL instances meet the stale criteria
@@ -220,7 +258,6 @@ function analyzeFlagsAcrossProjects(
 
     const keepBranch = keepBranches[0] as 'enabled' | 'disabled';
     // Use the most recent modification date across all projects
-    // (if updated 30 days ago in one project and 146 days in another, it's been stable for 30 days)
     const latestDate = new Date(Math.max(...infos.map((i) => i.updatedAt.getTime())));
     const daysSinceModified = Math.floor((now.getTime() - latestDate.getTime()) / (24 * 60 * 60 * 1000));
 
@@ -231,97 +268,68 @@ function analyzeFlagsAcrossProjects(
       ? `Inactive for ${daysSinceModified} days`
       : `${rollout}% rollout for ${daysSinceModified} days`;
 
+    // Use the first non-null creator (should be consistent across projects)
+    const createdBy = infos.find((i) => i.createdBy)?.createdBy || undefined;
+
     staleFlags.push({
       key,
       keepBranch,
       reason,
       lastModified: latestDate.toISOString(),
-      rolloutPercentage: rollout ?? 0,
-      projects: infos.map((i) => i.projectId),
+      createdBy,
+      metadata: {
+        rolloutPercentage: rollout ?? 0,
+        projects: infos.map((i) => i.projectId),
+      },
     });
   }
 
-  // Sort by oldest first
-  staleFlags.sort((a, b) => new Date(a.lastModified).getTime() - new Date(b.lastModified).getTime());
+  // Sort by oldest first (prioritize removing older flags)
+  staleFlags.sort(
+    (a, b) => new Date(a.lastModified!).getTime() - new Date(b.lastModified!).getTime()
+  );
 
   return staleFlags;
 }
 
-function parseArgs(): { staleDays: number; showAll: boolean } {
-  const args = process.argv.slice(2);
-  let staleDays = DEFAULT_STALE_DAYS;
-  let showAll = false;
+/**
+ * For debugging: show all flags with their status
+ */
+export async function showAllFlags(config: PostHogFetcherConfig): Promise<void> {
+  const apiKey = process.env.POSTHOG_API_KEY;
+  const projectIds = (process.env.POSTHOG_PROJECT_IDS || process.env.POSTHOG_PROJECT_ID || '')
+    .split(',')
+    .map((id) => id.trim())
+    .filter(Boolean);
+  const host = config.host || process.env.POSTHOG_HOST || 'https://app.posthog.com';
 
-  for (const arg of args) {
-    if (arg.startsWith('--stale-days=')) {
-      staleDays = parseInt(arg.split('=')[1], 10);
-    } else if (arg === '--show-all') {
-      showAll = true;
-    }
+  if (!apiKey) {
+    throw new Error('Missing POSTHOG_API_KEY environment variable');
   }
 
-  return { staleDays, showAll };
-}
-
-async function main() {
-  const { staleDays, showAll } = parseArgs();
-
-  if (POSTHOG_PROJECT_IDS.length === 0) {
+  if (projectIds.length === 0) {
     throw new Error('Missing POSTHOG_PROJECT_IDS or POSTHOG_PROJECT_ID environment variable');
   }
 
-  console.error(`Fetching feature flags from PostHog...`);
-  console.error(`Projects: ${POSTHOG_PROJECT_IDS.join(', ')}`);
+  console.error('\n--- All Flags ---');
 
-  // Fetch flags from all projects
-  const flagsByProject = new Map<string, PostHogFlag[]>();
-  let totalFlags = 0;
-
-  for (const projectId of POSTHOG_PROJECT_IDS) {
-    console.error(`  Fetching project ${projectId}...`);
-    const flags = await fetchFlagsForProject(projectId);
-    flagsByProject.set(projectId, flags);
-    totalFlags += flags.length;
-    console.error(`    Found ${flags.length} flags`);
-  }
-
-  console.error(`Total: ${totalFlags} flags across ${POSTHOG_PROJECT_IDS.length} project(s)`);
-
-  if (showAll) {
-    // Show all flags with their status (not just stale ones)
-    console.error('\n--- All Flags ---');
-    for (const [projectId, flags] of flagsByProject) {
-      console.error(`\nProject ${projectId}:`);
-      for (const flag of flags.slice(0, 20)) {
-        // Limit output
-        const rollout = getRolloutPercentage(flag);
-        const lastMod = new Date(flag.updated_at);
-        const hasPayloadFlag = hasPayload(flag);
-        const hasVariantsFlag = hasVariants(flag);
-        console.error(
-          `  ${flag.key}: rollout=${rollout}%, ` +
-            `updated=${lastMod.toISOString().split('T')[0]}, ` +
-            `payload=${hasPayloadFlag}, variants=${hasVariantsFlag}, ` +
-            `active=${flag.active}`
-        );
-      }
-      if (flags.length > 20) {
-        console.error(`  ... and ${flags.length - 20} more`);
-      }
+  for (const projectId of projectIds) {
+    const flags = await fetchFlagsForProject(projectId, apiKey, host);
+    console.error(`\nProject ${projectId}:`);
+    for (const flag of flags.slice(0, 20)) {
+      const rollout = getRolloutPercentage(flag);
+      const lastMod = new Date(flag.updated_at);
+      const hasPayloadFlag = hasPayload(flag);
+      const hasVariantsFlag = hasVariants(flag);
+      console.error(
+        `  ${flag.key}: rollout=${rollout}%, ` +
+          `updated=${lastMod.toISOString().split('T')[0]}, ` +
+          `payload=${hasPayloadFlag}, variants=${hasVariantsFlag}, ` +
+          `active=${flag.active}`
+      );
     }
-    console.error('');
+    if (flags.length > 20) {
+      console.error(`  ... and ${flags.length - 20} more`);
+    }
   }
-
-  const staleFlags = analyzeFlagsAcrossProjects(flagsByProject, staleDays);
-  console.error(
-    `\nFound ${staleFlags.length} stale flags (>${staleDays} days, 0% or 100% rollout, no payload, consistent across projects)`
-  );
-
-  // Output JSON to stdout (for piping to other tools)
-  console.log(JSON.stringify(staleFlags, null, 2));
 }
-
-main().catch((error) => {
-  console.error('Error:', error.message);
-  process.exit(1);
-});

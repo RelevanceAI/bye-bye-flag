@@ -2,10 +2,12 @@ import { execa } from 'execa';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import { CONFIG } from '../config.ts';
+import { consoleLogger, type Logger } from '../types.ts';
 
 export interface ScaffoldOptions {
   reposDir: string; // Directory containing bye-bye-flag.json and repo subdirectories
   branchName: string;
+  logger?: Logger; // Optional logger (defaults to console)
 }
 
 export interface ScaffoldResult {
@@ -24,7 +26,7 @@ export interface ScaffoldResult {
 export async function setupMultiRepoWorktrees(
   options: ScaffoldOptions
 ): Promise<ScaffoldResult> {
-  const { reposDir, branchName } = options;
+  const { reposDir, branchName, logger = consoleLogger } = options;
   const workspacePath = path.join(CONFIG.worktreeBasePath, branchName.replace(/\//g, '-'));
 
   // Ensure workspace path exists
@@ -60,16 +62,15 @@ export async function setupMultiRepoWorktrees(
     }
   }
 
-  const repos: ScaffoldResult['repos'] = [];
-
-  for (const repoName of configuredRepos) {
+  // Setup all repos in parallel for faster initialization
+  const repoSetupPromises = configuredRepos.map(async (repoName) => {
     const repoPath = path.join(reposDir, repoName);
     const worktreePath = path.join(workspacePath, repoName);
 
     // Clean up existing worktree if present
     try {
       await fs.access(worktreePath);
-      console.log(`Cleaning up existing worktree at ${worktreePath}...`);
+      logger.log(`[${repoName}] Cleaning up existing worktree...`);
       await execa('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: repoPath });
     } catch {
       // Doesn't exist, fine
@@ -84,18 +85,22 @@ export async function setupMultiRepoWorktrees(
     const defaultBranch = await getDefaultBranch(repoPath);
 
     // Create worktree with the new branch based on origin's default branch
-    console.log(`Creating worktree for ${repoName} on branch ${branchName}...`);
+    logger.log(`[${repoName}] Creating worktree on branch ${branchName}...`);
     await execa('git', ['worktree', 'add', '-b', branchName, worktreePath, `origin/${defaultBranch}`], { cwd: repoPath });
 
     // Setup node and run setup commands
-    await runSetupCommands(worktreePath, reposDir);
+    logger.log(`[${repoName}] Running setup commands...`);
+    await runSetupCommands(worktreePath, reposDir, logger);
+    logger.log(`[${repoName}] Setup complete`);
 
-    repos.push({
+    return {
       name: repoName,
       originalPath: repoPath,
       worktreePath,
-    });
-  }
+    };
+  });
+
+  const repos = await Promise.all(repoSetupPromises);
 
   // Copy any .md files from reposDir to workspace root (for context)
   const dirEntries = await fs.readdir(reposDir, { withFileTypes: true });
@@ -104,7 +109,7 @@ export async function setupMultiRepoWorktrees(
     await fs.copyFile(path.join(reposDir, mdFile.name), path.join(workspacePath, mdFile.name));
   }
 
-  console.log(`\nWorkspace created at ${workspacePath} with ${repos.length} repos`);
+  logger.log(`Workspace created at ${workspacePath} with ${repos.length} repos`);
 
   return { workspacePath, repos };
 }
@@ -160,7 +165,8 @@ export async function getDefaultBranch(repoPath: string): Promise<string> {
 
 interface RepoEntry {
   shellInit?: string; // Override shell init for this repo
-  setup: string[];
+  mainSetup?: string[]; // Setup commands for main repo (run once by orchestrator)
+  setup: string[]; // Setup commands for worktrees (run per flag)
 }
 
 interface ReposConfig {
@@ -206,13 +212,17 @@ export async function getShellInit(reposDir: string, repoName?: string): Promise
 /**
  * Runs setup commands for a repo
  * Requires bye-bye-flag.json with an entry for this repo
+ * Supports ${MAIN_REPO} substitution to reference the main repo path
  */
 async function runSetupCommands(
   worktreePath: string,
-  reposDir: string
+  reposDir: string,
+  logger: Logger
 ): Promise<void> {
   const repoName = path.basename(worktreePath);
   const config = await readConfig(reposDir);
+  // Use absolute path so it works from worktree location
+  const mainRepoPath = path.resolve(reposDir, repoName);
 
   const repoConfig = config.repos[repoName];
   if (!repoConfig) {
@@ -223,13 +233,16 @@ async function runSetupCommands(
   const shellInitCmd = repoConfig.shellInit ?? config.shellInit;
   const shellInit = shellInitCmd ? `${shellInitCmd} && ` : '';
 
-  // Run each setup command
-  for (const cmd of repoConfig.setup) {
-    console.log(`  Running: ${cmd}`);
+  // Run each setup command (output suppressed, errors shown on failure)
+  for (let cmd of repoConfig.setup) {
+    // Substitute ${MAIN_REPO} with the path to the main repo
+    cmd = cmd.replace(/\$\{MAIN_REPO\}/g, mainRepoPath);
+
+    logger.log(`  Running: ${cmd}`);
     try {
       await execa('bash', ['-c', `${shellInit}${cmd}`], {
         cwd: worktreePath,
-        stdio: 'inherit',
+        stdio: 'pipe',
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);

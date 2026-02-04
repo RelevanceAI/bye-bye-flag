@@ -1,8 +1,9 @@
 import { spawn } from 'child_process';
 import { v5 as uuidv5 } from 'uuid';
 import { CONFIG } from '../config.ts';
-import { AgentOutputSchema, type AgentOutput } from '../types.ts';
+import { AgentOutputSchema, consoleLogger, type AgentOutput, type Logger } from '../types.ts';
 import { getShellInit } from './scaffold.ts';
+import { registerChildProcess } from '../process-tracker.ts';
 
 const RESULT_DELIMITER = '---RESULT---';
 const MAX_RETRIES = 2;
@@ -25,7 +26,7 @@ interface RunResult {
 /**
  * Parses streaming JSON events and displays progress
  */
-function processStreamEvent(line: string): void {
+function processStreamEvent(line: string, logger: Logger): void {
   if (!line.trim()) return;
 
   try {
@@ -38,9 +39,9 @@ function processStreamEvent(line: string): void {
         if (event.message?.content) {
           for (const block of event.message.content) {
             if (block.type === 'text' && block.text) {
-              console.log(`[Claude] ${block.text}`);
+              logger.log(`[Claude] ${block.text}`);
             } else if (block.type === 'tool_use') {
-              console.log(`[Tool] ${block.name}: ${JSON.stringify(block.input).slice(0, 100)}...`);
+              logger.log(`[Tool] ${block.name}: ${JSON.stringify(block.input).slice(0, 100)}...`);
             }
           }
         }
@@ -54,14 +55,14 @@ function processStreamEvent(line: string): void {
               const preview = typeof block.content === 'string'
                 ? block.content.slice(0, 100)
                 : JSON.stringify(block.content).slice(0, 100);
-              console.log(`[Result] ${preview}...`);
+              logger.log(`[Result] ${preview}...`);
             }
           }
         }
         break;
 
       case 'result':
-        console.log(`[Done] Cost: $${event.cost_usd?.toFixed(4) || 'N/A'}, Duration: ${event.duration_ms}ms`);
+        logger.log(`[Done] Cost: $${event.cost_usd?.toFixed(4) || 'N/A'}, Duration: ${event.duration_ms}ms`);
         break;
 
       default:
@@ -80,7 +81,8 @@ function runClaudeCode(
   args: string[],
   cwd: string,
   timeout: number,
-  shellInit?: string
+  shellInit: string | undefined,
+  logger: Logger
 ): Promise<RunResult> {
   return new Promise((resolve) => {
     let stdout = '';
@@ -96,6 +98,9 @@ function runClaudeCode(
       env: { ...process.env },
     });
 
+    // Register for cleanup on Ctrl+C
+    registerChildProcess(child);
+
     const timeoutHandle = setTimeout(() => {
       timedOut = true;
       child.kill('SIGTERM');
@@ -110,19 +115,19 @@ function runClaudeCode(
       lineBuffer = lines.pop() || '';
 
       for (const line of lines) {
-        processStreamEvent(line);
+        processStreamEvent(line, logger);
       }
     });
 
     child.stderr.on('data', (chunk: Buffer) => {
-      process.stderr.write(chunk);
+      logger.error(chunk.toString().trimEnd());
     });
 
     child.on('close', (code) => {
       clearTimeout(timeoutHandle);
 
       if (lineBuffer.trim()) {
-        processStreamEvent(lineBuffer);
+        processStreamEvent(lineBuffer, logger);
       }
 
       resolve({ stdout, timedOut, exitCode: code });
@@ -146,15 +151,16 @@ export async function invokeClaudeCode(
   prompt: string,
   reposDir: string,
   repoName?: string, // For single-repo mode, to get repo-specific shellInit
-  providedSessionId?: string // Optional: use existing session ID (for resume)
+  providedSessionId?: string, // Optional: use existing session ID (for resume)
+  logger: Logger = consoleLogger // Optional logger (defaults to console)
 ): Promise<AgentOutput> {
   const sessionId = providedSessionId || getSessionId(branchName);
   const shellInit = await getShellInit(reposDir, repoName);
 
-  console.log(`Invoking Claude Code (session: ${sessionId.slice(0, 8)}...)...`);
-  console.log(`Working directory: ${worktreePath}`);
-  console.log(`Prompt length: ${prompt.length} characters`);
-  console.log('\n--- Claude Code Output ---\n');
+  logger.log(`Invoking Claude Code (session: ${sessionId.slice(0, 8)}...)...`);
+  logger.log(`Working directory: ${worktreePath}`);
+  logger.log(`Prompt length: ${prompt.length} characters`);
+  logger.log('--- Claude Code Output ---');
 
   // Initial run
   const initialArgs = [
@@ -165,13 +171,13 @@ export async function invokeClaudeCode(
     '-p', prompt,
   ];
 
-  let result = await runClaudeCode(initialArgs, worktreePath, CONFIG.claudeTimeout, shellInit);
+  let result = await runClaudeCode(initialArgs, worktreePath, CONFIG.claudeTimeout, shellInit, logger);
   let retries = 0;
 
   // Retry with --resume if timed out
   while (result.timedOut && retries < MAX_RETRIES) {
     retries++;
-    console.log(`\n[Timeout] Resuming session (attempt ${retries}/${MAX_RETRIES})...\n`);
+    logger.log(`[Timeout] Resuming session (attempt ${retries}/${MAX_RETRIES})...`);
 
     const resumePrompt = retries === MAX_RETRIES
       ? 'You are running out of time. Stop what you are doing immediately and provide a summary of what you have completed so far. List all files you have modified.'
@@ -185,7 +191,7 @@ export async function invokeClaudeCode(
       '-p', resumePrompt,
     ];
 
-    const resumeResult = await runClaudeCode(resumeArgs, worktreePath, CONFIG.claudeTimeout, shellInit);
+    const resumeResult = await runClaudeCode(resumeArgs, worktreePath, CONFIG.claudeTimeout, shellInit, logger);
     result = {
       stdout: result.stdout + resumeResult.stdout,
       timedOut: resumeResult.timedOut,
@@ -193,18 +199,18 @@ export async function invokeClaudeCode(
     };
   }
 
-  console.log('\n--- End Claude Code Output ---\n');
-  console.log(`Claude Code exit code: ${result.exitCode}`);
+  logger.log('--- End Claude Code Output ---');
+  logger.log(`Claude Code exit code: ${result.exitCode}`);
 
   if (result.timedOut) {
-    console.log('[Warning] Session timed out after all retries, attempting to parse partial output...');
+    logger.log('[Warning] Session timed out after all retries, attempting to parse partial output...');
   }
 
   if (!result.stdout || result.stdout.length === 0) {
     throw new Error('Claude Code produced no output');
   }
 
-  return parseStreamOutput(result.stdout, worktreePath);
+  return parseStreamOutput(result.stdout, worktreePath, logger);
 }
 
 /**
@@ -213,10 +219,11 @@ export async function invokeClaudeCode(
 export async function resumeClaudeCode(
   worktreePath: string,
   sessionId: string,
-  additionalPrompt?: string
+  additionalPrompt?: string,
+  logger: Logger = consoleLogger
 ): Promise<AgentOutput> {
-  console.log(`Resuming Claude Code session (${sessionId.slice(0, 8)}...)...`);
-  console.log('\n--- Claude Code Output ---\n');
+  logger.log(`Resuming Claude Code session (${sessionId.slice(0, 8)}...)...`);
+  logger.log('--- Claude Code Output ---');
 
   const args = [
     '--resume', sessionId,
@@ -228,15 +235,15 @@ export async function resumeClaudeCode(
     args.push('-p', additionalPrompt);
   }
 
-  const result = await runClaudeCode(args, worktreePath, CONFIG.claudeTimeout);
+  const result = await runClaudeCode(args, worktreePath, CONFIG.claudeTimeout, undefined, logger);
 
-  console.log('\n--- End Claude Code Output ---\n');
+  logger.log('--- End Claude Code Output ---');
 
   if (!result.stdout || result.stdout.length === 0) {
     throw new Error('Claude Code produced no output');
   }
 
-  return parseStreamOutput(result.stdout, worktreePath);
+  return parseStreamOutput(result.stdout, worktreePath, logger);
 }
 
 /**
@@ -273,8 +280,8 @@ function extractAssistantText(stdout: string): { text: string; hasResult: boolea
 /**
  * Uses a quick Claude call to normalize any output format to our expected JSON
  */
-async function normalizeOutput(rawOutput: string, cwd: string): Promise<AgentOutput> {
-  console.log('\nNormalizing output format...');
+async function normalizeOutput(rawOutput: string, cwd: string, logger: Logger): Promise<AgentOutput> {
+  logger.log('Normalizing output format...');
 
   const normalizePrompt = `Convert the following feature flag removal output to this exact JSON format. Output ONLY the JSON, no other text:
 
@@ -314,6 +321,9 @@ ${rawOutput.length > 12000
       }
     );
 
+    // Register for cleanup on Ctrl+C
+    registerChildProcess(child);
+
     const timeout = setTimeout(() => {
       child.kill('SIGTERM');
       reject(new Error('Normalize call timed out'));
@@ -324,7 +334,7 @@ ${rawOutput.length > 12000
     });
 
     child.stderr.on('data', (chunk: Buffer) => {
-      process.stderr.write(chunk);
+      logger.error(chunk.toString().trimEnd());
     });
 
     child.on('close', (code) => {
@@ -365,7 +375,7 @@ ${rawOutput.length > 12000
  * Parses the stream-json output to extract the final result
  * Uses a follow-up Claude call to normalize the output format
  */
-async function parseStreamOutput(stdout: string, cwd: string): Promise<AgentOutput> {
+async function parseStreamOutput(stdout: string, cwd: string, logger: Logger): Promise<AgentOutput> {
   const { text, hasResult } = extractAssistantText(stdout);
 
   if (!hasResult) {
@@ -385,7 +395,7 @@ async function parseStreamOutput(stdout: string, cwd: string): Promise<AgentOutp
   }
 
   // Use Claude to normalize whatever format was output
-  return normalizeOutput(text, cwd);
+  return normalizeOutput(text, cwd, logger);
 }
 
 /**

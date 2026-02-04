@@ -1,52 +1,98 @@
 #!/usr/bin/env node
 
 import { parseArgs } from 'node:util';
+import * as fs from 'fs/promises';
 import { removeFlag } from './agent/index.ts';
+import { run, runWithInput } from './orchestrator/index.ts';
+import { readConfig } from './agent/scaffold.ts';
+import { setupSignalHandlers } from './process-tracker.ts';
+import type { FetcherConfig } from './fetchers/types.ts';
 
 const helpText = `
 bye-bye-flag - Remove stale feature flags from codebases using AI
 
 Usage:
-  npx tsx src/cli.ts remove --flag=<key> --keep=<branch> --repos-dir=<path> [options]
+  pnpm start <command> [options]
 
 Commands:
-  remove    Remove a feature flag from one or more repositories
+  run       Fetch stale flags and process them (main command)
+  remove    Remove a single flag (for testing/manual use)
+
+Options for 'run':
+  --repos-dir=<path>     Path to directory containing bye-bye-flag.json (required)
+  --concurrency=<n>      Max agents running in parallel (default: 2)
+  --max-prs=<n>          Stop after creating this many PRs (default: 10)
+  --log-dir=<path>       Directory for agent logs (default: ./bye-bye-flag-logs)
+  --input=<file>         Use a JSON file instead of fetcher (optional)
+  --dry-run              Run agents in dry-run mode (no PRs)
 
 Options for 'remove':
   --flag=<key>           The feature flag key to remove (required)
   --keep=<branch>        Which branch to keep: "enabled" or "disabled" (required)
-  --repos-dir=<path>     Path to directory containing bye-bye-flag.json and repo subdirectories (required)
+  --repos-dir=<path>     Path to directory containing bye-bye-flag.json (required)
   --dry-run              Show diff without creating PR
-  --keep-worktree        Keep worktree after dry-run (for manual inspection with git diff)
+  --keep-worktree        Keep worktree after completion
 
-Directory structure:
-  repos-dir/
-    bye-bye-flag.json    # Config file (required)
-    CONTEXT.md           # Optional context for the AI
-    repo1/               # Git repository
-    repo2/               # Git repository (can have 1 or more repos)
+Configuration (bye-bye-flag.json):
+  {
+    "fetcher": {
+      "type": "posthog",
+      "staleDays": 30
+    },
+    "orchestrator": {
+      "concurrency": 2,
+      "maxPrs": 10
+    },
+    "repos": {
+      "my-repo": { "setup": ["pnpm install"] }
+    }
+  }
 
 Examples:
-  # Remove a flag, keeping the enabled code path
-  npx tsx src/cli.ts remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/repos
+  # Run the orchestrator (fetches stale flags and processes them)
+  pnpm start run --repos-dir=/path/to/repos
 
-  # Dry run to see what changes would be made
-  npx tsx src/cli.ts remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/repos --dry-run
+  # Dry run to see what would happen
+  pnpm start run --repos-dir=/path/to/repos --dry-run
 
-  # Keep worktree for manual inspection
-  npx tsx src/cli.ts remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/repos --dry-run --keep-worktree
+  # Process a custom list of flags
+  pnpm start run --repos-dir=/path/to/repos --input=my-flags.json
+
+  # Remove a single flag manually
+  pnpm start remove --flag=my-flag --keep=enabled --repos-dir=/path/to/repos
 `;
 
+interface ExtendedConfig {
+  fetcher?: FetcherConfig;
+  orchestrator?: {
+    concurrency?: number;
+    maxPrs?: number;
+    logDir?: string;
+  };
+  repos: Record<string, { setup: string[]; shellInit?: string }>;
+  shellInit?: string;
+}
+
 async function main() {
+  setupSignalHandlers();
   const { values, positionals } = parseArgs({
     allowPositionals: true,
     options: {
-      flag: { type: 'string' },
-      keep: { type: 'string' },
+      // Shared
       'repos-dir': { type: 'string' },
       'dry-run': { type: 'boolean', default: false },
-      'keep-worktree': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h' },
+
+      // run command
+      concurrency: { type: 'string' },
+      'max-prs': { type: 'string' },
+      'log-dir': { type: 'string' },
+      input: { type: 'string' },
+
+      // remove command
+      flag: { type: 'string' },
+      keep: { type: 'string' },
+      'keep-worktree': { type: 'boolean', default: false },
     },
   });
 
@@ -57,7 +103,76 @@ async function main() {
 
   const command = positionals[0];
 
-  if (command === 'remove') {
+  if (command === 'run') {
+    if (!values['repos-dir']) {
+      console.error('Error: --repos-dir is required');
+      console.log(helpText);
+      process.exit(1);
+    }
+
+    const reposDir = values['repos-dir'];
+
+    // Read config to get fetcher and orchestrator settings
+    let config: ExtendedConfig;
+    try {
+      const configPath = `${reposDir}/bye-bye-flag.json`;
+      const content = await fs.readFile(configPath, 'utf-8');
+      config = JSON.parse(content);
+    } catch {
+      console.error(`Error: Could not read bye-bye-flag.json from ${reposDir}`);
+      process.exit(1);
+    }
+
+    // Helper to parse and validate numeric CLI arguments
+    const parsePositiveInt = (value: string | undefined, name: string, defaultValue?: number): number | undefined => {
+      if (value === undefined) return defaultValue;
+      const parsed = parseInt(value, 10);
+      if (isNaN(parsed) || parsed < 1 || !Number.isInteger(parsed)) {
+        console.error(`Error: --${name} must be a positive integer, got "${value}"`);
+        process.exit(1);
+      }
+      return parsed;
+    };
+
+    // Merge CLI options with config file
+    const concurrency =
+      parsePositiveInt(values.concurrency, 'concurrency', config.orchestrator?.concurrency) ?? 2;
+    const maxPrs =
+      parsePositiveInt(values['max-prs'], 'max-prs', config.orchestrator?.maxPrs) ?? 10;
+    const logDir = values['log-dir'] || config.orchestrator?.logDir;
+
+    // If --input is provided, use file instead of fetcher
+    if (values.input) {
+      const summary = await runWithInput({
+        reposDir,
+        inputFile: values.input,
+        concurrency,
+        maxPrs,
+        logDir,
+        dryRun: values['dry-run'],
+      });
+      process.exit(summary.results.failed > 0 ? 1 : 0);
+    }
+
+    // Get fetcher config (default to posthog)
+    const fetcher: FetcherConfig = config.fetcher || { type: 'posthog' };
+
+    if (fetcher.type === 'manual') {
+      console.error('Error: Fetcher type is "manual" but no --input file provided');
+      process.exit(1);
+    }
+
+    const summary = await run({
+      reposDir,
+      fetcher,
+      concurrency,
+      maxPrs,
+      logDir,
+      dryRun: values['dry-run'],
+    });
+
+    process.exit(summary.results.failed > 0 ? 1 : 0);
+  } else if (command === 'remove') {
     if (!values.flag || !values.keep) {
       console.error('Error: --flag and --keep are required for remove command');
       console.log(helpText);

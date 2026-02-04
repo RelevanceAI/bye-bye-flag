@@ -161,6 +161,58 @@ export async function findExistingPR(repoPath: string, flagKey: string): Promise
 }
 
 /**
+ * Fetches ALL bye-bye-flag PRs from a repo in a single API call
+ * Much more efficient than calling findExistingPR for each flag
+ */
+export async function fetchAllFlagPRs(
+  repoPath: string
+): Promise<Map<string, ExistingPR>> {
+  const result = new Map<string, ExistingPR>();
+
+  try {
+    // Fetch all PRs (any state) - we'll filter by branch prefix
+    // Using search query for branches starting with remove-flag/
+    const { stdout } = await execa(
+      'gh',
+      [
+        'pr',
+        'list',
+        '--state',
+        'all',
+        '--json',
+        'url,state,title,headRefName',
+        '--limit',
+        '500', // Should be enough for most repos
+      ],
+      { cwd: repoPath }
+    );
+
+    const prs = JSON.parse(stdout) as Array<{
+      url: string;
+      state: 'OPEN' | 'CLOSED' | 'MERGED';
+      title: string;
+      headRefName: string;
+    }>;
+
+    for (const pr of prs) {
+      // Only include PRs from our branches
+      if (pr.headRefName.startsWith('remove-flag/')) {
+        const flagKey = pr.headRefName.replace('remove-flag/', '');
+        result.set(flagKey, {
+          url: pr.url,
+          state: pr.state,
+          declined: pr.title.includes('[DECLINED]'),
+        });
+      }
+    }
+  } catch {
+    // gh command failed, return empty map
+  }
+
+  return result;
+}
+
+/**
  * Creates a draft PR using GitHub CLI
  */
 export async function createPR(

@@ -8,7 +8,11 @@ Remove stale feature flags from codebases using AI.
 
 - **Node.js 24+** (native TypeScript support)
 - **git**
-- **Agent CLI**: either **[Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code)** (`claude`) or **Codex CLI** (`codex`)
+- **Agent CLI**: either **[Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code)** (`claude`) or **[Codex CLI](https://developers.openai.com/codex/cli/)** (`codex`)
+  - macOS: if you installed the **[Codex app](https://openai.com/codex/)**, the CLI binary is bundled at `/Applications/Codex.app/Contents/Resources/codex`. To expose it on your `PATH`:
+    ```bash
+    ln -s /Applications/Codex.app/Contents/Resources/codex ~/.local/bin/codex
+    ```
 - **[GitHub CLI](https://cli.github.com/)**: Required for creating PRs (not needed for `--dry-run`)
 
 ## Installation

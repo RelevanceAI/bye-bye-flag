@@ -6,7 +6,6 @@ import { consoleLogger, type AgentKind, type Logger, type RemovalRequest, type R
 import {
   setupMultiRepoWorktrees,
   cleanupMultiRepoWorktrees,
-  readConfig,
   getDefaultBranch,
   type ScaffoldResult,
 } from './scaffold.ts';
@@ -15,8 +14,10 @@ import { invokeClaudeCode } from './invoke.ts';
 import { invokeCodexCli } from './invoke-codex.ts';
 import { commitAndPushMultiRepo, findExistingPR, hasChanges, showDiff } from './git.ts';
 import { getSessionId } from './invoke.ts';
+import type { ConfigContext } from '../config-context.ts';
 
 export interface RemoveFlagOptions extends RemovalRequest {
+  configContext: ConfigContext;
   logger?: Logger; // Optional logger (defaults to console)
   // Internal: used by orchestrator to skip redundant preflight checks.
   skipFetch?: boolean;
@@ -25,8 +26,8 @@ export interface RemoveFlagOptions extends RemovalRequest {
 /**
  * Fetch latest from origin for all configured repos
  */
-async function fetchAllRepos(reposDir: string): Promise<void> {
-  const config = await readConfig(reposDir);
+async function fetchAllRepos(configContext: ConfigContext): Promise<void> {
+  const { reposDir, config } = configContext;
   const repoNames = Object.keys(config.repos);
 
   for (const repoName of repoNames) {
@@ -88,8 +89,12 @@ async function flagExistsInCodebase(workspacePath: string, flagKey: string): Pro
 /**
  * Check prerequisites before running
  */
-async function checkPrerequisites(request: RemovalRequest): Promise<string[]> {
+async function checkPrerequisites(
+  configContext: ConfigContext,
+  dryRun: boolean | undefined
+): Promise<string[]> {
   const errors: string[] = [];
+  const { reposDir, config } = configContext;
 
   // Check git is installed
   try {
@@ -100,19 +105,18 @@ async function checkPrerequisites(request: RemovalRequest): Promise<string[]> {
 
   // Check repos directory exists
   try {
-    const stat = await fs.stat(request.reposDir);
+    const stat = await fs.stat(reposDir);
     if (!stat.isDirectory()) {
-      errors.push(`--repos-dir is not a directory: ${request.reposDir}`);
+      errors.push(`Config directory is not a directory: ${reposDir}`);
     }
   } catch {
-    errors.push(`--repos-dir does not exist: ${request.reposDir}`);
+    errors.push(`Config directory does not exist: ${reposDir}`);
   }
 
   // Read config to determine which agent CLI is required
   let agentKind: AgentKind | null = null;
   if (errors.length === 0) {
     try {
-      const config = await readConfig(request.reposDir);
       agentKind = (config.agent?.type ?? 'claude') as AgentKind;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -135,7 +139,7 @@ async function checkPrerequisites(request: RemovalRequest): Promise<string[]> {
   }
 
   // Check gh CLI only if we'll create PRs (not dry-run)
-  if (!request.dryRun) {
+  if (!dryRun) {
     try {
       await execa('gh', ['--version']);
       // Check if authenticated
@@ -156,14 +160,16 @@ async function checkPrerequisites(request: RemovalRequest): Promise<string[]> {
  * Operates on a directory containing bye-bye-flag-config.json and one or more git repos
  */
 export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalResult> {
-  const { flagKey, keepBranch, reposDir, dryRun, keepWorktree, logger = consoleLogger } = options;
+  const { flagKey, keepBranch, dryRun, keepWorktree, configContext, logger = consoleLogger } =
+    options;
+  const { reposDir, configPath, config } = configContext;
   const branchName = `${CONFIG.branchPrefix}${flagKey}`;
   let agentKind: AgentKind = 'claude';
   let agentSessionId: string | undefined;
 
   // Check prerequisites first
   logger.log('Checking prerequisites...');
-  const errors = await checkPrerequisites(options);
+  const errors = await checkPrerequisites(configContext, dryRun);
   if (errors.length > 0) {
     logger.error('Prerequisite check failed:');
     errors.forEach((e) => logger.error(`  - ${e}`));
@@ -184,13 +190,12 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
   // When called from orchestrator, skipFetch=true and these checks are already done at orchestrator level
   if (!options.skipFetch) {
     logger.log('Fetching latest from origin...');
-    await fetchAllRepos(reposDir);
+    await fetchAllRepos(configContext);
 
     // In standalone mode (remove command), protect against overwriting an existing open/declined PR.
     // The orchestrator performs this check in batch before invoking the agent.
     if (!dryRun) {
       logger.log('Checking for existing PRs...');
-      const config = await readConfig(reposDir);
       const repoNames = Object.keys(config.repos);
 
       for (const repoName of repoNames) {
@@ -238,6 +243,7 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
     // Setup worktrees for all repos
     scaffoldResult = await setupMultiRepoWorktrees({
       reposDir,
+      configPath,
       branchName,
       deleteRemoteBranch: !dryRun,
       logger,
@@ -254,9 +260,12 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
     logger.log(`Found ${scaffoldResult.repos.length} repos:`);
     scaffoldResult.repos.forEach((r) => logger.log(`  - ${r.name}`));
 
-    const config = await readConfig(reposDir);
     agentKind = (config.agent?.type ?? 'claude') as AgentKind;
     const agentArgs = config.agent?.args ?? [];
+    const agentTimeoutMs =
+      config.agent?.timeoutMinutes !== undefined
+        ? config.agent.timeoutMinutes * 60 * 1000
+        : CONFIG.agentTimeoutMs;
 
     // Read context from workspace (copied from reposDir)
     const globalContext = await readContextFiles(scaffoldResult.workspacePath);
@@ -281,12 +290,23 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
         prompt,
         reposDir,
         undefined,
+        configPath,
         agentSessionId,
         logger,
-        agentArgs
+        agentArgs,
+        agentTimeoutMs
       );
     } else if (agentKind === 'codex') {
-      const codexResult = await invokeCodexCli(scaffoldResult.workspacePath, prompt, reposDir, undefined, logger, agentArgs);
+      const codexResult = await invokeCodexCli(
+        scaffoldResult.workspacePath,
+        prompt,
+        reposDir,
+        undefined,
+        configPath,
+        logger,
+        agentArgs,
+        agentTimeoutMs
+      );
       agentSessionId = codexResult.sessionId;
       agentOutput = codexResult.output;
     } else {
@@ -344,8 +364,32 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
 
     const successCount = repoResults.filter((r) => r.status === 'success').length;
     const noChangesCount = repoResults.filter((r) => r.status === 'no-changes').length;
+    const failedResults = repoResults.filter((r) => r.status === 'failed');
 
-    logger.log(`Results: ${successCount} PRs created, ${noChangesCount} repos unchanged`);
+    logger.log(
+      `Results: ${successCount} PRs created, ${noChangesCount} repos unchanged, ${failedResults.length} failed`
+    );
+
+    if (failedResults.length > 0) {
+      logger.log('Failed repos:');
+      for (const r of failedResults) {
+        logger.log(`  - ${r.repoName}: ${r.error ?? 'unknown error'}`);
+      }
+
+      // If nothing was created successfully, treat the whole run as failed so the orchestrator
+      // doesn't misreport it as "no changes needed".
+      if (successCount === 0) {
+        const failedRepos = failedResults.map((r) => r.repoName).join(', ');
+        return {
+          status: 'failed',
+          error: `Failed to create PRs in ${failedResults.length} repo(s): ${failedRepos}`,
+          branchName,
+          summary: agentOutput.summary,
+          filesChanged: agentOutput.filesChanged,
+          repoResults,
+        };
+      }
+    }
 
     return {
       status: 'success',

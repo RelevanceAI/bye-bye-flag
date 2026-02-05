@@ -7,6 +7,7 @@ import { consoleLogger, type Logger } from '../types.ts';
 
 export interface ScaffoldOptions {
   reposDir: string; // Directory containing bye-bye-flag-config.json and repo subdirectories
+  configPath?: string; // Optional explicit path to config file
   branchName: string;
   /**
    * If true, delete the remote branch on origin before recreating it locally.
@@ -33,14 +34,15 @@ export interface ScaffoldResult {
 export async function setupMultiRepoWorktrees(
   options: ScaffoldOptions
 ): Promise<ScaffoldResult> {
-  const { reposDir, branchName, deleteRemoteBranch = true, logger = consoleLogger } = options;
-  const workspacePath = path.join(CONFIG.worktreeBasePath, branchName.replace(/\//g, '-'));
+  const { reposDir, configPath, branchName, deleteRemoteBranch = true, logger = consoleLogger } = options;
+  const config = await readConfig(reposDir, configPath);
+  const worktreeBasePath = config.worktrees?.basePath ?? CONFIG.worktreeBasePath;
+  const workspacePath = path.join(worktreeBasePath, branchName.replace(/\//g, '-'));
 
   // Ensure workspace path exists
   await fs.mkdir(workspacePath, { recursive: true });
 
-  // Read config and validate repos
-  const config = await readConfig(reposDir);
+  // Validate repos
   const configuredRepos = Object.keys(config.repos);
 
   if (configuredRepos.length === 0) {
@@ -99,7 +101,7 @@ export async function setupMultiRepoWorktrees(
 
     // Setup node and run setup commands
     logger.log(`[${repoName}] Running setup commands...`);
-    await runSetupCommands(worktreePath, reposDir, logger);
+    await runSetupCommands(worktreePath, reposDir, logger, configPath);
     logger.log(`[${repoName}] Setup complete`);
 
     return {
@@ -176,7 +178,7 @@ const RepoEntrySchema = z
   .object({
     shellInit: z.string().optional(), // Override shell init for this repo
     mainSetup: z.array(z.string()).optional(), // Setup commands for main repo (run once by orchestrator)
-    setup: z.array(z.string()), // Setup commands for worktrees (run per flag)
+    setup: z.array(z.string()).optional(), // Setup commands for worktrees (run per flag)
   })
   .strict();
 
@@ -188,10 +190,28 @@ const OrchestratorSettingsSchema = z
   })
   .strict();
 
+const WorktreesSchema = z
+  .object({
+    basePath: z.string().optional(),
+  })
+  .strict();
+
+const RepoDefaultsSchema = z
+  .object({
+    shellInit: z.string().optional(),
+    mainSetup: z.array(z.string()).optional(),
+    setup: z.array(z.string()).optional(),
+  })
+  .strict();
+
 const FetcherConfigSchema = z.discriminatedUnion('type', [
   z
     .object({
       type: z.literal('posthog'),
+      projectIds: z
+        .array(z.union([z.string(), z.number().int().positive()]))
+        .min(1)
+        .transform((ids) => ids.map(String)),
       staleDays: z.number().int().positive().optional(),
       host: z.string().optional(),
     })
@@ -208,6 +228,11 @@ const AgentConfigSchema = z.discriminatedUnion('type', [
        * Do not include the prompt/session flags; those are managed by bye-bye-flag.
        */
       args: z.array(z.string()).optional(),
+      /**
+       * Timeout for a single agent run (in minutes).
+       * If unset, defaults to CONFIG.agentTimeoutMs.
+       */
+      timeoutMinutes: z.number().int().positive().optional(),
     })
     .strict(),
   z
@@ -218,6 +243,11 @@ const AgentConfigSchema = z.discriminatedUnion('type', [
        * Do not include the prompt/session flags; those are managed by bye-bye-flag.
        */
       args: z.array(z.string()).optional(),
+      /**
+       * Timeout for a single agent run (in minutes).
+       * If unset, defaults to CONFIG.agentTimeoutMs.
+       */
+      timeoutMinutes: z.number().int().positive().optional(),
     })
     .strict(),
 ]);
@@ -226,11 +256,24 @@ const ByeByeFlagConfigSchema = z
   .object({
     fetcher: FetcherConfigSchema.optional(),
     agent: AgentConfigSchema.optional(),
+    worktrees: WorktreesSchema.optional(),
     orchestrator: OrchestratorSettingsSchema.optional(),
-    shellInit: z.string().optional(), // Default command to run before each shell command
+    repoDefaults: RepoDefaultsSchema.optional(),
     repos: z.record(RepoEntrySchema),
   })
-  .strict();
+  .strict()
+  .superRefine((cfg, ctx) => {
+    for (const [repoName, repoCfg] of Object.entries(cfg.repos)) {
+      const hasSetup = repoCfg.setup !== undefined || cfg.repoDefaults?.setup !== undefined;
+      if (!hasSetup) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['repos', repoName, 'setup'],
+          message: 'Missing setup commands. Set repos.<name>.setup or repoDefaults.setup.',
+        });
+      }
+    }
+  });
 
 export type ByeByeFlagConfig = z.infer<typeof ByeByeFlagConfigSchema>;
 
@@ -239,12 +282,18 @@ let cachedConfigPath: string | null = null;
 
 /**
  * Reads bye-bye-flag-config.json from the repos root directory
+ * Optionally accepts an explicit configPath
  * Throws if config file is missing
  */
 const CONFIG_FILENAME = 'bye-bye-flag-config.json';
 
-export async function readConfig(reposDir: string): Promise<ByeByeFlagConfig> {
-  const preferredPath = path.join(reposDir, CONFIG_FILENAME);
+function resolveConfigPath(reposDir: string, configPath?: string): string {
+  if (configPath) return path.resolve(configPath);
+  return path.join(reposDir, CONFIG_FILENAME);
+}
+
+export async function readConfig(reposDir: string, configPath?: string): Promise<ByeByeFlagConfig> {
+  const preferredPath = resolveConfigPath(reposDir, configPath);
 
   if (cachedConfig && cachedConfigPath === preferredPath) {
     return cachedConfig;
@@ -282,12 +331,16 @@ export async function readConfig(reposDir: string): Promise<ByeByeFlagConfig> {
 /**
  * Gets the shellInit command for a specific repo (or default)
  */
-export async function getShellInit(reposDir: string, repoName?: string): Promise<string | undefined> {
-  const config = await readConfig(reposDir);
+export async function getShellInit(
+  reposDir: string,
+  repoName?: string,
+  configPath?: string
+): Promise<string | undefined> {
+  const config = await readConfig(reposDir, configPath);
   if (repoName && config.repos[repoName]?.shellInit !== undefined) {
     return config.repos[repoName].shellInit;
   }
-  return config.shellInit;
+  return config.repoDefaults?.shellInit;
 }
 
 /**
@@ -298,10 +351,11 @@ export async function getShellInit(reposDir: string, repoName?: string): Promise
 async function runSetupCommands(
   worktreePath: string,
   reposDir: string,
-  logger: Logger
+  logger: Logger,
+  configPath?: string
 ): Promise<void> {
   const repoName = path.basename(worktreePath);
-  const config = await readConfig(reposDir);
+  const config = await readConfig(reposDir, configPath);
   // Use absolute path so it works from worktree location
   const mainRepoPath = path.resolve(reposDir, repoName);
 
@@ -310,12 +364,20 @@ async function runSetupCommands(
     throw new Error(`No config entry for repo "${repoName}" in bye-bye-flag-config.json`);
   }
 
-  // Per-repo shellInit takes precedence over default
-  const shellInitCmd = repoConfig.shellInit ?? config.shellInit;
+  // Per-repo shellInit takes precedence over repoDefaults
+  const shellInitCmd = repoConfig.shellInit ?? config.repoDefaults?.shellInit;
   const shellInit = shellInitCmd ? `${shellInitCmd} && ` : '';
 
+  const setupCommands =
+    repoConfig.setup !== undefined ? repoConfig.setup : config.repoDefaults?.setup;
+  if (!setupCommands) {
+    throw new Error(
+      `Missing setup commands for repo "${repoName}". Add repos.${repoName}.setup or repoDefaults.setup to bye-bye-flag-config.json`
+    );
+  }
+
   // Run each setup command (output suppressed, errors shown on failure)
-  for (let cmd of repoConfig.setup) {
+  for (let cmd of setupCommands) {
     // Substitute ${MAIN_REPO} with the path to the main repo
     cmd = cmd.replace(/\$\{MAIN_REPO\}/g, mainRepoPath);
 

@@ -23,9 +23,9 @@ cd bye-bye-flag
 nvm use
 pnpm install
 
-# Create .env file with your configuration
+# Create .env file with secrets (optional if using --input)
 cp .env.example .env
-# Edit .env with your PostHog API key and project IDs
+# Edit .env with your PostHog API key (POSTHOG_API_KEY)
 ```
 
 ## Directory Structure
@@ -43,22 +43,24 @@ my-repos/
 ## Usage
 
 If you're running from source, replace `bye-bye-flag` with `pnpm start`.
+Pass `--target-repos` to point at the directory that contains `bye-bye-flag-config.json` and all target repos.
 
 ```bash
 # Run the orchestrator - fetches stale flags and processes them
-bye-bye-flag run --repos-dir=/path/to/my-repos
+bye-bye-flag run --target-repos=/path/to/target-repos
 
 # Dry run to preview what would happen
-bye-bye-flag run --repos-dir=/path/to/my-repos --dry-run
+bye-bye-flag run --target-repos=/path/to/target-repos --dry-run
 
 # Find flags with no code references (quick wins to delete from PostHog)
-bye-bye-flag run --repos-dir=/path/to/my-repos --max-prs=0
+# Set "orchestrator.maxPrs": 0 in config, then run:
+bye-bye-flag run --target-repos=/path/to/target-repos
 
 # Process flags from a custom JSON file
-bye-bye-flag run --repos-dir=/path/to/my-repos --input=my-flags.json
+bye-bye-flag run --target-repos=/path/to/target-repos --input=my-flags.json
 
 # Remove a single flag manually (for testing)
-bye-bye-flag remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/my-repos
+bye-bye-flag remove --target-repos=/path/to/target-repos --flag=enable-dashboard --keep=enabled
 ```
 
 ## Options
@@ -67,10 +69,7 @@ bye-bye-flag remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--repos-dir=<path>` | (required) | Path to directory containing bye-bye-flag-config.json |
-| `--concurrency=<n>` | 2 | Max agents running in parallel |
-| `--max-prs=<n>` | 10 | Stop after creating this many PRs |
-| `--log-dir=<path>` | `./bye-bye-flag-logs` | Directory for agent logs |
+| `--target-repos=<path>` | (required) | Path to target repos root |
 | `--input=<file>` | (fetcher) | Use a JSON file instead of fetcher |
 | `--dry-run` | false | Run agents in dry-run mode (no PRs) |
 
@@ -80,7 +79,7 @@ bye-bye-flag remove --flag=enable-dashboard --keep=enabled --repos-dir=/path/to/
 |--------|-------------|
 | `--flag=<key>` | The feature flag key to remove (required) |
 | `--keep=<branch>` | Which code path to keep: `enabled` or `disabled` (required) |
-| `--repos-dir=<path>` | Path to directory containing bye-bye-flag-config.json (required) |
+| `--target-repos=<path>` | Path to target repos root (required) |
 | `--dry-run` | Preview changes without creating a PR |
 | `--keep-worktree` | Keep the worktree after completion for manual inspection |
 
@@ -90,16 +89,16 @@ Test your `bye-bye-flag-config.json` setup commands without running the full orc
 
 ```bash
 # Test all repos
-pnpm test-setup --repos-dir=/path/to/my-repos
+pnpm test-setup --target-repos=/path/to/target-repos
 
 # Test a specific repo
-pnpm test-setup --repos-dir=/path/to/my-repos --repo=my-api
+pnpm test-setup --target-repos=/path/to/target-repos --repo=my-api
 
 # Test only worktree setup (skip mainSetup)
-pnpm test-setup --repos-dir=/path/to/my-repos --skip-main-setup
+pnpm test-setup --target-repos=/path/to/target-repos --skip-main-setup
 
 # Test only mainSetup (skip worktree creation)
-pnpm test-setup --repos-dir=/path/to/my-repos --skip-worktree
+pnpm test-setup --target-repos=/path/to/target-repos --skip-worktree
 ```
 
 This creates a temporary worktree, runs your setup commands, and cleans up. Useful for debugging setup failures.
@@ -148,13 +147,20 @@ Example files are available in `examples/`.
 {
   "fetcher": {
     "type": "posthog",
+    "projectIds": [12345, 67890],
     "staleDays": 30
   },
-  "orchestrator": {
-    "concurrency": 2,
-    "maxPrs": 10
+  "worktrees": {
+    "basePath": "/tmp/bye-bye-flag-worktrees"
   },
-  "shellInit": "source ~/.nvm/nvm.sh && nvm use",
+  "orchestrator": {
+    "concurrency": 3,
+    "maxPrs": 10,
+    "logDir": "./bye-bye-flag-logs"
+  },
+  "repoDefaults": {
+    "shellInit": "source ~/.nvm/nvm.sh && nvm use"
+  },
   "repos": {
     "my-api": {
       "setup": ["pnpm install", "pnpm run codegen"]
@@ -171,13 +177,15 @@ Example files are available in `examples/`.
 
 - `agent.type`: Which agent CLI to use (`claude` or `codex`, default: `claude`)
 - `agent.args`: Extra CLI args appended to the agent invocation (optional)
+- `agent.timeoutMinutes`: Timeout for a single agent run, in minutes (default: 60)
 
 Example:
 ```json
 {
   "agent": {
     "type": "codex",
-    "args": ["--model", "o3"]
+    "args": ["--model", "o3"],
+    "timeoutMinutes": 60
   }
 }
 ```
@@ -185,22 +193,60 @@ Example:
 ### Fetcher Configuration
 
 - `fetcher.type`: Which fetcher to use (`posthog` or `manual`)
+- `fetcher.projectIds`: PostHog project IDs to fetch flags from (required for `posthog`)
 - `fetcher.staleDays`: Days since last update to consider a flag stale (default: 30)
+- `fetcher.host`: PostHog host (optional, default: `https://app.posthog.com`)
 
 ### Orchestrator Configuration
 
-- `orchestrator.concurrency`: Max agents running in parallel (default: 2)
+- `orchestrator.concurrency`: Max agents running in parallel (default: 3)
 - `orchestrator.maxPrs`: Stop after creating this many PRs (default: 10)
 - `orchestrator.logDir`: Directory for agent logs (default: `./bye-bye-flag-logs`)
 
+### Worktree Configuration
+
+- `worktrees.basePath`: Where to create worktrees (optional, default: `/tmp/bye-bye-flag-worktrees`)
+
 ### Repo Configuration
 
-- `shellInit` (optional): Default command to run before each shell command (setup and agent)
+- `repoDefaults.shellInit` (optional): Default command to run before each shell command (setup and agent)
+- `repoDefaults.mainSetup` (optional): Default mainSetup commands (applied to every repo unless overridden)
+- `repoDefaults.setup`: Default setup commands for worktrees (recommended)
 - `repos.<name>.shellInit` (optional): Override shellInit for a specific repo
-- `repos.<name>.mainSetup` (optional): Setup commands for the main repo (run once per orchestrator run)
-- `repos.<name>.setup`: Setup commands for worktrees (run per flag, supports `${MAIN_REPO}` substitution)
+- `repos.<name>.mainSetup` (optional): Override mainSetup commands for a repo
+- `repos.<name>.setup` (optional): Override setup commands for a repo (supports `${MAIN_REPO}` substitution)
 
-**Optimization tip:** Use `mainSetup` to run `pnpm install` once on the main repo, then use `setup` to copy/link node_modules to worktrees:
+**Simple setup:** Install dependencies in each worktree (most compatible, slower):
+
+```json
+{
+  "repoDefaults": {
+    "setup": ["pnpm install"]
+  },
+  "repos": {
+    "my-repo": {}
+  }
+}
+```
+
+**Optimization tip:** Use `mainSetup` to run `pnpm install` once on the main repo (to populate the pnpm store), then use `setup` to prefer cached packages in each worktree:
+
+```json
+{
+  "repos": {
+    "my-repo": {
+      "mainSetup": ["pnpm install"],
+      "setup": ["pnpm install --frozen-lockfile --prefer-offline"]
+    }
+  }
+}
+```
+
+This avoids network downloads for every flag while keeping the worktree `node_modules` layout consistent.
+
+If you need to guarantee **no network access**, use `--offline` instead. Note: `--offline` will fail if the required packages are not already present in the pnpm store.
+
+If you've verified that copying/linking `node_modules` works for your repo, you can do that instead (faster, but less portable):
 
 ```json
 {
@@ -213,8 +259,6 @@ Example:
 }
 ```
 
-This avoids running `pnpm install` for every flag, significantly speeding up batch processing.
-
 ## Context Files
 
 You can provide additional context to the agent by placing markdown files in your repos directory:
@@ -224,25 +268,13 @@ You can provide additional context to the agent by placing markdown files in you
 
 These files are automatically included in the prompt.
 
-## Environment Variables
+## Environment Variables (Secrets)
 
-Create a `.env` file (copy from `.env.example`):
+Create a `.env` file (copy from `.env.example`) if you're using the PostHog fetcher:
 
 ```bash
-# Custom worktree location (default: /tmp/bye-bye-flag-worktrees)
-WORKTREE_BASE_PATH=/path/to/worktrees
-
 # PostHog integration (required for fetching stale flags)
 POSTHOG_API_KEY=phx_xxx
-
-# Single project:
-POSTHOG_PROJECT_ID=12345
-
-# Or multiple projects (comma-separated, e.g., dev and prod):
-POSTHOG_PROJECT_IDS=12345,67890
-
-# Optional: PostHog host (default: https://app.posthog.com)
-# POSTHOG_HOST=https://app.posthog.com
 ```
 
 ## Fetching Stale Flags (PostHog)
@@ -260,13 +292,13 @@ The PostHog fetcher finds flags that are candidates for removal.
 
 ```bash
 # Fetch stale flags
-pnpm run fetch:posthog
+pnpm run fetch:posthog -- --target-repos=/path/to/target-repos
 
 # Custom stale threshold (days)
-pnpm run fetch:posthog -- --stale-days=60
+pnpm run fetch:posthog -- --target-repos=/path/to/target-repos --stale-days=60
 
 # Show all flags with their status (not just stale ones)
-pnpm run fetch:posthog -- --show-all
+pnpm run fetch:posthog -- --target-repos=/path/to/target-repos --show-all
 ```
 
 Output is JSON to stdout:
@@ -276,13 +308,19 @@ Output is JSON to stdout:
     "key": "old-feature",
     "keepBranch": "enabled",
     "reason": "100% rollout for 45 days",
-    "projects": ["12345", "67890"]
+    "lastModified": "2025-12-01T00:00:00.000Z",
+    "metadata": {
+      "projects": ["12345", "67890"]
+    }
   },
   {
     "key": "killed-feature",
     "keepBranch": "disabled",
     "reason": "Inactive for 90 days",
-    "projects": ["12345"]
+    "lastModified": "2025-11-01T00:00:00.000Z",
+    "metadata": {
+      "projects": ["12345"]
+    }
   }
 ]
 ```
@@ -348,7 +386,7 @@ Processed: 10 flags
   ○ 3 no code references
   ✗ 0 failed
   ⊘ 1 skipped
-  … 11 remaining (--max-prs limit)
+  … 11 remaining (maxPrs limit)
 
 PRs created:
   • enable-dashboard: https://github.com/org/my-frontend/pull/123

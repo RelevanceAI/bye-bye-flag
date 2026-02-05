@@ -6,50 +6,87 @@
  * Can be used for testing or piped to other tools.
  *
  * Usage:
- *   pnpm run fetch:posthog
- *   pnpm run fetch:posthog -- --stale-days=60
- *   pnpm run fetch:posthog -- --show-all
+ *   pnpm run fetch:posthog -- --target-repos=/path/to/target-repos
+ *   pnpm run fetch:posthog -- --target-repos=/path/to/target-repos --stale-days=60
+ *   pnpm run fetch:posthog -- --target-repos=/path/to/target-repos --show-all
  */
 
+import { parseArgs } from 'node:util';
 import { fetchFlags, showAllFlags } from './index.ts';
 import type { PostHogFetcherConfig } from '../types.ts';
 import { loadEnvFileIfExists } from '../../env.ts';
+import { loadConfigContext } from '../../config-context.ts';
 
-function parseArgs(): { staleDays: number; showAll: boolean } {
-  const args = process.argv.slice(2);
-  let staleDays = 30;
-  let showAll = false;
+function parseCliArgs(): { targetRepos?: string; staleDays?: number; showAll: boolean; help: boolean } {
+  const rawArgs = process.argv.slice(2);
+  const args = rawArgs[0] === '--' ? rawArgs.slice(1) : rawArgs;
+  const { values } = parseArgs({
+    args,
+    options: {
+      'target-repos': { type: 'string' },
+      'stale-days': { type: 'string' },
+      'show-all': { type: 'boolean', default: false },
+      help: { type: 'boolean', short: 'h' },
+    },
+  });
 
-  for (const arg of args) {
-    if (arg.startsWith('--stale-days=')) {
-      const value = arg.split('=')[1] ?? '';
-      const parsed = parseInt(value, 10);
-      if (!Number.isFinite(parsed) || parsed < 1) {
-        throw new Error(`--stale-days must be a positive integer, got "${value}"`);
-      }
-      staleDays = parsed;
-    } else if (arg === '--show-all') {
-      showAll = true;
+  let staleDays: number | undefined = undefined;
+  const staleDaysRaw = values['stale-days'];
+  if (staleDaysRaw !== undefined) {
+    const parsed = parseInt(staleDaysRaw, 10);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      throw new Error(`--stale-days must be a positive integer, got "${staleDaysRaw}"`);
     }
+    staleDays = parsed;
   }
 
-  return { staleDays, showAll };
+  return {
+    targetRepos: values['target-repos'],
+    staleDays,
+    showAll: values['show-all'],
+    help: values.help ?? false,
+  };
 }
 
 async function main() {
   loadEnvFileIfExists('.env');
-  let staleDays: number;
+  let targetRepos: string | undefined;
+  let staleDays: number | undefined;
   let showAll: boolean;
+  let help = false;
   try {
-    ({ staleDays, showAll } = parseArgs());
+    ({ targetRepos, staleDays, showAll, help } = parseCliArgs());
   } catch (error) {
     console.error('Error:', error instanceof Error ? error.message : String(error));
     process.exit(1);
   }
 
+  if (help || !targetRepos) {
+    console.log(`
+PostHog Feature Flags Fetcher
+
+Usage:
+  pnpm run fetch:posthog -- --target-repos=/path/to/target-repos [options]
+
+Options:
+  --target-repos=<path> Path to target repos root (required)
+  --stale-days=<days>   Override stale days from config
+  --show-all            Print all flags before stale filtering
+  -h, --help            Show this help
+`);
+    process.exit(help ? 0 : 1);
+  }
+
+  const byeByeConfig = (await loadConfigContext(targetRepos)).config;
+  const fetcher = byeByeConfig.fetcher;
+  if (!fetcher || fetcher.type !== 'posthog') {
+    console.error('Error: fetcher.type must be "posthog" in bye-bye-flag-config.json');
+    process.exit(1);
+  }
+
   const config: PostHogFetcherConfig = {
-    type: 'posthog',
-    staleDays,
+    ...fetcher,
+    staleDays: staleDays ?? fetcher.staleDays,
   };
 
   if (showAll) {

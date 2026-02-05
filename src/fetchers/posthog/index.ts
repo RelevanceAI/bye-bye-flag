@@ -70,11 +70,8 @@ const DEFAULT_STALE_DAYS = 30;
  */
 export async function fetchFlags(config: PostHogFetcherConfig): Promise<FlagToRemove[]> {
   const apiKey = process.env.POSTHOG_API_KEY;
-  const projectIds = (process.env.POSTHOG_PROJECT_IDS || process.env.POSTHOG_PROJECT_ID || '')
-    .split(',')
-    .map((id) => id.trim())
-    .filter(Boolean);
-  const host = config.host || process.env.POSTHOG_HOST || 'https://app.posthog.com';
+  const projectIds = config.projectIds;
+  const host = config.host || 'https://app.posthog.com';
   const staleDays = config.staleDays ?? DEFAULT_STALE_DAYS;
 
   if (!apiKey) {
@@ -82,7 +79,7 @@ export async function fetchFlags(config: PostHogFetcherConfig): Promise<FlagToRe
   }
 
   if (projectIds.length === 0) {
-    throw new Error('Missing POSTHOG_PROJECT_IDS or POSTHOG_PROJECT_ID environment variable');
+    throw new Error('Missing fetcher.projectIds in bye-bye-flag-config.json');
   }
 
   console.error(`Fetching feature flags from PostHog...`);
@@ -303,18 +300,15 @@ function analyzeFlagsAcrossProjects(
  */
 export async function showAllFlags(config: PostHogFetcherConfig): Promise<void> {
   const apiKey = process.env.POSTHOG_API_KEY;
-  const projectIds = (process.env.POSTHOG_PROJECT_IDS || process.env.POSTHOG_PROJECT_ID || '')
-    .split(',')
-    .map((id) => id.trim())
-    .filter(Boolean);
-  const host = config.host || process.env.POSTHOG_HOST || 'https://app.posthog.com';
+  const projectIds = config.projectIds;
+  const host = config.host || 'https://app.posthog.com';
 
   if (!apiKey) {
     throw new Error('Missing POSTHOG_API_KEY environment variable');
   }
 
   if (projectIds.length === 0) {
-    throw new Error('Missing POSTHOG_PROJECT_IDS or POSTHOG_PROJECT_ID environment variable');
+    throw new Error('Missing fetcher.projectIds in bye-bye-flag-config.json');
   }
 
   console.error('\n--- All Flags ---');

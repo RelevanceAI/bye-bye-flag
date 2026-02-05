@@ -4,8 +4,8 @@
  * Test utility to validate setup commands without running the full orchestrator.
  *
  * Usage:
- *   pnpm test-setup --repos-dir=/path/to/repos
- *   pnpm test-setup --repos-dir=/path/to/repos --repo=relevance-api-node
+ *   pnpm test-setup --target-repos=/path/to/target-repos
+ *   pnpm test-setup --target-repos=/path/to/target-repos --repo=relevance-api-node
  */
 
 import { parseArgs } from 'node:util';
@@ -13,8 +13,9 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { execa } from 'execa';
 import { CONFIG } from './config.ts';
-import { getDefaultBranch, readConfig, type ByeByeFlagConfig } from './agent/scaffold.ts';
+import { getDefaultBranch, type ByeByeFlagConfig } from './agent/scaffold.ts';
 import { loadEnvFileIfExists } from './env.ts';
+import { loadConfigContext } from './config-context.ts';
 
 async function runCommand(cmd: string, cwd: string, shellInit?: string): Promise<boolean> {
   const shellPrefix = shellInit ? `${shellInit} && ` : '';
@@ -49,7 +50,7 @@ async function testRepo(
   }
 
   const repoPath = path.join(reposDir, repoName);
-  const shellInit = repoConfig.shellInit ?? config.shellInit;
+  const shellInit = repoConfig.shellInit ?? config.repoDefaults?.shellInit;
 
   console.log(`\n${'═'.repeat(60)}`);
   console.log(`Testing: ${repoName}`);
@@ -76,7 +77,8 @@ async function testRepo(
 
   // Create a test worktree
   const testBranch = 'test-setup-' + Date.now();
-  const worktreePath = path.join(CONFIG.worktreeBasePath, testBranch, repoName);
+  const worktreeBasePath = config.worktrees?.basePath ?? CONFIG.worktreeBasePath;
+  const worktreePath = path.join(worktreeBasePath, testBranch, repoName);
 
   console.log(`\n--- Creating test worktree ---`);
   console.log(`  Branch: ${testBranch}`);
@@ -96,7 +98,16 @@ async function testRepo(
     console.log(`\n--- Setup Commands (on ${worktreePath}) ---`);
     const mainRepoPath = path.resolve(reposDir, repoName);
 
-    for (let cmd of repoConfig.setup) {
+    const setupCommands =
+      repoConfig.setup !== undefined ? repoConfig.setup : config.repoDefaults?.setup;
+    if (!setupCommands) {
+      console.error(
+        `Missing setup commands for repo "${repoName}". Add repos.${repoName}.setup or repoDefaults.setup to bye-bye-flag-config.json`
+      );
+      return false;
+    }
+
+    for (let cmd of setupCommands) {
       // Substitute ${MAIN_REPO}
       cmd = cmd.replace(/\$\{MAIN_REPO\}/g, mainRepoPath);
 
@@ -131,7 +142,7 @@ async function main() {
   const { values } = parseArgs({
     args,
     options: {
-      'repos-dir': { type: 'string' },
+      'target-repos': { type: 'string' },
       'repo': { type: 'string' },
       'skip-main-setup': { type: 'boolean', default: false },
       'skip-worktree': { type: 'boolean', default: false },
@@ -139,15 +150,15 @@ async function main() {
     },
   });
 
-  if (values.help || !values['repos-dir']) {
+  if (values.help || !values['target-repos']) {
     console.log(`
 Test setup commands for bye-bye-flag
 
 Usage:
-  pnpm test-setup --repos-dir=/path/to/repos [options]
+  pnpm test-setup --target-repos=/path/to/target-repos [options]
 
 Options:
-  --repos-dir=<path>    Path to directory containing bye-bye-flag-config.json (required)
+  --target-repos=<path> Path to target repos root (required)
   --repo=<name>         Test only this repo (default: test all)
   --skip-main-setup     Skip mainSetup commands (test only worktree setup)
   --skip-worktree       Skip worktree creation (test only mainSetup)
@@ -155,19 +166,19 @@ Options:
 
 Examples:
   # Test all repos
-  pnpm test-setup --repos-dir=.target-repos
+  pnpm test-setup --target-repos=.target-repos
 
   # Test only relevance-api-node
-  pnpm test-setup --repos-dir=.target-repos --repo=relevance-api-node
+  pnpm test-setup --target-repos=.target-repos --repo=relevance-api-node
 
   # Test only worktree setup (assume mainSetup already done)
-  pnpm test-setup --repos-dir=.target-repos --skip-main-setup
+  pnpm test-setup --target-repos=.target-repos --skip-main-setup
 `);
     process.exit(values.help ? 0 : 1);
   }
 
-  const reposDir = values['repos-dir'];
-  const config = await readConfig(reposDir);
+  const configContext = await loadConfigContext(values['target-repos']);
+  const { reposDir, config } = configContext;
   const repoNames = values.repo ? [values.repo] : Object.keys(config.repos);
 
   console.log(`\nTesting setup for ${repoNames.length} repo(s)...`);

@@ -3,10 +3,9 @@
 import { parseArgs } from 'node:util';
 import { removeFlag } from './agent/index.ts';
 import { run, runWithInput } from './orchestrator/index.ts';
-import { readConfig } from './agent/scaffold.ts';
 import { setupSignalHandlers } from './process-tracker.ts';
-import type { FetcherConfig } from './fetchers/types.ts';
 import { loadEnvFileIfExists } from './env.ts';
+import { loadConfigContext, requireFetcher } from './config-context.ts';
 
 const helpText = `
 bye-bye-flag - Remove stale feature flags from codebases using AI
@@ -22,17 +21,14 @@ Commands:
   remove    Remove a single flag (for testing/manual use)
 
 Options for 'run':
-  --repos-dir=<path>     Path to directory containing bye-bye-flag-config.json (required)
-  --concurrency=<n>      Max agents running in parallel (default: 2)
-  --max-prs=<n>          Stop after creating this many PRs (default: 10)
-  --log-dir=<path>       Directory for agent logs (default: ./bye-bye-flag-logs)
+  --target-repos=<path>  Path to target repos root (required)
   --input=<file>         Use a JSON file instead of fetcher (optional)
   --dry-run              Run agents in dry-run mode (no PRs)
 
 Options for 'remove':
   --flag=<key>           The feature flag key to remove (required)
   --keep=<branch>        Which branch to keep: "enabled" or "disabled" (required)
-  --repos-dir=<path>     Path to directory containing bye-bye-flag-config.json (required)
+  --target-repos=<path>  Path to target repos root (required)
   --dry-run              Show diff without creating PR
   --keep-worktree        Keep worktree after completion
 
@@ -40,32 +36,40 @@ Configuration (bye-bye-flag-config.json):
   {
     "fetcher": {
       "type": "posthog",
+      "projectIds": [12345],
       "staleDays": 30
     },
     "agent": {
       "type": "claude"
     },
+    "worktrees": {
+      "basePath": "/tmp/bye-bye-flag-worktrees"
+    },
     "orchestrator": {
-      "concurrency": 2,
-      "maxPrs": 10
+      "concurrency": 3,
+      "maxPrs": 10,
+      "logDir": "./bye-bye-flag-logs"
+    },
+    "repoDefaults": {
+      "setup": ["pnpm install"]
     },
     "repos": {
-      "my-repo": { "setup": ["pnpm install"] }
+      "my-repo": {}
     }
   }
 
 Examples:
   # Run the orchestrator (fetches stale flags and processes them)
-  bye-bye-flag run --repos-dir=/path/to/repos
+  bye-bye-flag run --target-repos=/path/to/target-repos
 
   # Dry run to see what would happen
-  bye-bye-flag run --repos-dir=/path/to/repos --dry-run
+  bye-bye-flag run --target-repos=/path/to/target-repos --dry-run
 
   # Process a custom list of flags
-  bye-bye-flag run --repos-dir=/path/to/repos --input=my-flags.json
+  bye-bye-flag run --target-repos=/path/to/target-repos --input=my-flags.json
 
   # Remove a single flag manually
-  bye-bye-flag remove --flag=my-flag --keep=enabled --repos-dir=/path/to/repos
+  bye-bye-flag remove --target-repos=/path/to/target-repos --flag=my-flag --keep=enabled
 `;
 
 async function main() {
@@ -79,14 +83,11 @@ async function main() {
     args,
     options: {
       // Shared
-      'repos-dir': { type: 'string' },
+      'target-repos': { type: 'string' },
       'dry-run': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h' },
 
       // run command
-      concurrency: { type: 'string' },
-      'max-prs': { type: 'string' },
-      'log-dir': { type: 'string' },
       input: { type: 'string' },
 
       // remove command
@@ -102,89 +103,44 @@ async function main() {
   }
 
   const command = positionals[0];
+  const targetReposArg = values['target-repos'];
+
+  if (!targetReposArg) {
+    console.error('Error: --target-repos is required');
+    console.log(helpText);
+    process.exit(1);
+  }
 
   if (command === 'run') {
-    if (!values['repos-dir']) {
-      console.error('Error: --repos-dir is required');
+    let configContext: Awaited<ReturnType<typeof loadConfigContext>>;
+    try {
+      configContext = await loadConfigContext(targetReposArg);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Error: ${message}`);
       console.log(helpText);
       process.exit(1);
     }
 
-    const reposDir = values['repos-dir'];
-
-    // Read config to get fetcher and orchestrator settings
-    let config: Awaited<ReturnType<typeof readConfig>>;
-    try {
-      config = await readConfig(reposDir);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      console.error(`Error: ${message}`);
-      process.exit(1);
-    }
-
-    // Helper to parse and validate numeric CLI arguments
-    const parsePositiveInt = (
-      value: string | undefined,
-      name: string,
-      defaultValue?: number
-    ): number | undefined => {
-      if (value === undefined) return defaultValue;
-      const parsed = parseInt(value, 10);
-      if (!Number.isFinite(parsed) || parsed < 1 || !Number.isInteger(parsed)) {
-        console.error(`Error: --${name} must be a positive integer, got "${value}"`);
-        process.exit(1);
-      }
-      return parsed;
-    };
-
-    const parseNonNegativeInt = (
-      value: string | undefined,
-      name: string,
-      defaultValue?: number
-    ): number | undefined => {
-      if (value === undefined) return defaultValue;
-      const parsed = parseInt(value, 10);
-      if (!Number.isFinite(parsed) || parsed < 0 || !Number.isInteger(parsed)) {
-        console.error(`Error: --${name} must be a non-negative integer, got "${value}"`);
-        process.exit(1);
-      }
-      return parsed;
-    };
-
-    // Merge CLI options with config file
-    const concurrency =
-      parsePositiveInt(values.concurrency, 'concurrency', config.orchestrator?.concurrency) ?? 2;
-    const maxPrs =
-      parseNonNegativeInt(values['max-prs'], 'max-prs', config.orchestrator?.maxPrs) ?? 10;
-    const logDir = values['log-dir'] || config.orchestrator?.logDir;
-
     // If --input is provided, use file instead of fetcher
     if (values.input) {
       const summary = await runWithInput({
-        reposDir,
+        configContext,
         inputFile: values.input,
-        concurrency,
-        maxPrs,
-        logDir,
         dryRun: values['dry-run'],
       });
       process.exit(summary.results.failed > 0 ? 1 : 0);
     }
 
-    // Get fetcher config (default to posthog)
-    const fetcher: FetcherConfig = config.fetcher || { type: 'posthog' };
-
+    const fetcher = requireFetcher(configContext.config);
     if (fetcher.type === 'manual') {
       console.error('Error: Fetcher type is "manual" but no --input file provided');
       process.exit(1);
     }
 
     const summary = await run({
-      reposDir,
+      configContext,
       fetcher,
-      concurrency,
-      maxPrs,
-      logDir,
       dryRun: values['dry-run'],
     });
 
@@ -196,21 +152,25 @@ async function main() {
       process.exit(1);
     }
 
-    if (!values['repos-dir']) {
-      console.error('Error: --repos-dir is required');
-      console.log(helpText);
+    if (values.keep !== 'enabled' && values.keep !== 'disabled') {
+      console.error('Error: --keep must be "enabled" or "disabled"');
       process.exit(1);
     }
 
-    if (values.keep !== 'enabled' && values.keep !== 'disabled') {
-      console.error('Error: --keep must be "enabled" or "disabled"');
+    let configContext: Awaited<ReturnType<typeof loadConfigContext>>;
+    try {
+      configContext = await loadConfigContext(targetReposArg);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(`Error: ${message}`);
+      console.log(helpText);
       process.exit(1);
     }
 
     const result = await removeFlag({
       flagKey: values.flag,
       keepBranch: values.keep,
-      reposDir: values['repos-dir'],
+      configContext,
       dryRun: values['dry-run'],
       keepWorktree: values['keep-worktree'],
     });

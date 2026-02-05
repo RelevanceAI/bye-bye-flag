@@ -151,12 +151,14 @@ export async function invokeClaudeCode(
   prompt: string,
   reposDir: string,
   repoName?: string, // For single-repo mode, to get repo-specific shellInit
+  configPath?: string, // Optional explicit path to config file
   providedSessionId?: string, // Optional: use existing session ID (for resume)
   logger: Logger = consoleLogger, // Optional logger (defaults to console)
-  extraArgs: string[] = []
+  extraArgs: string[] = [],
+  timeoutMs: number = CONFIG.agentTimeoutMs
 ): Promise<AgentOutput> {
   const sessionId = providedSessionId || getSessionId(branchName);
-  const shellInit = await getShellInit(reposDir, repoName);
+  const shellInit = await getShellInit(reposDir, repoName, configPath);
 
   logger.log(`Invoking Claude Code (session: ${sessionId.slice(0, 8)}...)...`);
   logger.log(`Working directory: ${worktreePath}`);
@@ -173,7 +175,7 @@ export async function invokeClaudeCode(
     '-p', prompt,
   ];
 
-  let result = await runClaudeCode(initialArgs, worktreePath, CONFIG.agentTimeoutMs, shellInit, logger);
+  let result = await runClaudeCode(initialArgs, worktreePath, timeoutMs, shellInit, logger);
   let retries = 0;
 
   // Retry with --resume if timed out
@@ -194,7 +196,7 @@ export async function invokeClaudeCode(
       '-p', resumePrompt,
     ];
 
-    const resumeResult = await runClaudeCode(resumeArgs, worktreePath, CONFIG.agentTimeoutMs, shellInit, logger);
+    const resumeResult = await runClaudeCode(resumeArgs, worktreePath, timeoutMs, shellInit, logger);
     result = {
       stdout: result.stdout + resumeResult.stdout,
       timedOut: resumeResult.timedOut,
@@ -224,7 +226,8 @@ export async function resumeClaudeCode(
   sessionId: string,
   additionalPrompt?: string,
   logger: Logger = consoleLogger,
-  extraArgs: string[] = []
+  extraArgs: string[] = [],
+  timeoutMs: number = CONFIG.agentTimeoutMs
 ): Promise<AgentOutput> {
   logger.log(`Resuming Claude Code session (${sessionId.slice(0, 8)}...)...`);
   logger.log('--- Claude Code Output ---');
@@ -240,7 +243,7 @@ export async function resumeClaudeCode(
     args.push('-p', additionalPrompt);
   }
 
-  const result = await runClaudeCode(args, worktreePath, CONFIG.agentTimeoutMs, undefined, logger);
+  const result = await runClaudeCode(args, worktreePath, timeoutMs, undefined, logger);
 
   logger.log('--- End Claude Code Output ---');
 

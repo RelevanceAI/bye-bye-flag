@@ -22,6 +22,7 @@ export interface BaseFetcherConfig {
  */
 export interface PostHogFetcherConfig extends BaseFetcherConfig {
   type: 'posthog';
+  projectIds: string[];
   staleDays?: number;
   host?: string;
 }

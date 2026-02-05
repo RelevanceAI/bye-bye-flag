@@ -22,9 +22,6 @@ export interface RemovalRequest {
   keepBranch: 'enabled' | 'disabled';
   dryRun?: boolean;
   keepWorktree?: boolean; // Don't cleanup worktree (for manual inspection)
-
-  // Directory containing bye-bye-flag-config.json and one or more git repos as subdirectories
-  reposDir: string;
 }
 
 export interface RepoResult {

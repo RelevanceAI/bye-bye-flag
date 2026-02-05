@@ -11,6 +11,8 @@ import { getShellInit } from './scaffold.ts';
 const UUID_RE =
   /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/i;
 
+const MAX_EVENT_LOG_CHARS = 3000;
+
 function buildAgentOutputJsonSchema(): unknown {
   // Keep this in sync with AgentOutputSchema in src/types.ts.
   return {
@@ -27,6 +29,32 @@ function buildAgentOutputJsonSchema(): unknown {
       typecheckPass: { type: 'boolean' },
     },
   };
+}
+
+function tryFormatJsonEventForLog(event: unknown, rawLine: string): string | null {
+  if (!event || typeof event !== 'object') return null;
+  const obj = event as Record<string, unknown>;
+  const type = typeof obj.type === 'string' ? obj.type : undefined;
+  if (!type) return null;
+
+  // Suppress ultra-noisy token deltas if present.
+  if (type.toLowerCase().includes('delta')) return null;
+
+  if (type === 'item.completed') {
+    const item = obj.item;
+    if (item && typeof item === 'object') {
+      const itemObj = item as Record<string, unknown>;
+      const itemType = typeof itemObj.type === 'string' ? itemObj.type : undefined;
+      if (itemType === 'reasoning') {
+        const text = typeof itemObj.text === 'string' ? itemObj.text : '';
+        const len = text ? ` (${text.length} chars suppressed)` : ' (suppressed)';
+        return `[Codex] item.completed: reasoning${len}`;
+      }
+    }
+  }
+
+  const line = rawLine.length > MAX_EVENT_LOG_CHARS ? rawLine.slice(0, MAX_EVENT_LOG_CHARS) + '… (truncated)' : rawLine;
+  return `[Codex] ${line}`;
 }
 
 function tryFindSessionIdFromEvent(event: unknown): string | undefined {
@@ -115,6 +143,8 @@ function runCodexExec(
         try {
           const event = JSON.parse(trimmed);
           if (!sessionId) sessionId = tryFindSessionIdFromEvent(event);
+          const formatted = tryFormatJsonEventForLog(event, trimmed);
+          if (formatted) logger.log(formatted);
         } catch {
           // Non-JSON output (warnings, etc.) — still helpful in logs.
           logger.log(trimmed);
@@ -134,6 +164,8 @@ function runCodexExec(
         try {
           const event = JSON.parse(trimmed);
           if (!sessionId) sessionId = tryFindSessionIdFromEvent(event);
+          const formatted = tryFormatJsonEventForLog(event, trimmed);
+          if (formatted) logger.log(formatted);
         } catch {
           logger.log(trimmed);
         }
@@ -159,13 +191,15 @@ export async function invokeCodexCli(
   prompt: string,
   reposDir: string,
   repoName?: string,
+  configPath?: string,
   logger: Logger = consoleLogger,
-  extraArgs: string[] = []
+  extraArgs: string[] = [],
+  timeoutMs: number = CONFIG.agentTimeoutMs
 ): Promise<InvokeCodexResult> {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'bye-bye-flag-codex-'));
   const schemaPath = path.join(tmpDir, 'agent-output.schema.json');
   const lastMessagePath = path.join(tmpDir, 'last-message.txt');
-  const shellInit = await getShellInit(reposDir, repoName);
+  const shellInit = await getShellInit(reposDir, repoName, configPath);
 
   try {
     await fs.writeFile(schemaPath, JSON.stringify(buildAgentOutputJsonSchema(), null, 2), 'utf-8');
@@ -192,7 +226,7 @@ export async function invokeCodexCli(
     args.push('-');
 
     logger.log('--- Codex Output ---');
-    const result = await runCodexExec(args, worktreePath, prompt, CONFIG.agentTimeoutMs, shellInit, logger);
+    const result = await runCodexExec(args, worktreePath, prompt, timeoutMs, shellInit, logger);
     logger.log('--- End Codex Output ---');
     logger.log(`Codex exit code: ${result.exitCode}`);
 

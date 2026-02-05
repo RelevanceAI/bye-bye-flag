@@ -10,17 +10,16 @@ import { execa } from 'execa';
 import { fetchFlags, type FlagToRemove, type FetcherConfig } from '../fetchers/index.ts';
 import { removeFlag } from '../agent/index.ts';
 import { fetchAllFlagPRs, type ExistingPR } from '../agent/git.ts';
-import { getDefaultBranch, readConfig } from '../agent/scaffold.ts';
+import { getDefaultBranch } from '../agent/scaffold.ts';
 import { createRunLogger, type FlagLogger, type LogStatus } from './logger.ts';
 import type { RemovalResult } from '../types.ts';
 import { CONFIG } from '../config.ts';
+import type { ConfigContext, RuntimeSettings } from '../config-context.ts';
+import { getRuntimeSettings } from '../config-context.ts';
 
 export interface OrchestratorConfig {
-  reposDir: string;
+  configContext: ConfigContext;
   fetcher: FetcherConfig;
-  concurrency?: number;
-  maxPrs?: number;
-  logDir?: string;
   dryRun?: boolean;
 }
 
@@ -61,10 +60,6 @@ export interface RunSummary {
   logDir: string;
 }
 
-const DEFAULT_CONCURRENCY = 2;
-const DEFAULT_MAX_PRS = 10;
-const DEFAULT_LOG_DIR = './bye-bye-flag-logs';
-
 type FlagWithCodeReferences = FlagToRemove & { reposWithCode: string[] };
 
 /**
@@ -94,9 +89,9 @@ async function flagExistsInRepo(
  */
 async function filterFlagsWithCodeReferences(
   flags: FlagToRemove[],
-  reposDir: string
+  configContext: ConfigContext
 ): Promise<{ flagsWithCode: FlagWithCodeReferences[]; flagsWithoutCode: FlagResult[] }> {
-  const config = await readConfig(reposDir);
+  const { reposDir, config } = configContext;
   const repoNames = Object.keys(config.repos);
 
   console.log('Checking for code references...');
@@ -162,8 +157,8 @@ async function filterFlagsWithCodeReferences(
 /**
  * Fetch latest from origin for all configured repos
  */
-async function fetchAllRepos(reposDir: string): Promise<void> {
-  const config = await readConfig(reposDir);
+async function fetchAllRepos(configContext: ConfigContext): Promise<void> {
+  const { reposDir, config } = configContext;
   const repoNames = Object.keys(config.repos);
 
   console.log('Fetching latest from origin...');
@@ -184,14 +179,16 @@ async function fetchAllRepos(reposDir: string): Promise<void> {
  * Run mainSetup commands on the main repos (not worktrees)
  * This runs once per orchestrator run, so worktrees can copy/link node_modules
  */
-async function runMainSetup(reposDir: string): Promise<void> {
-  const config = await readConfig(reposDir);
+async function runMainSetup(configContext: ConfigContext): Promise<void> {
+  const { reposDir, config } = configContext;
   const repoNames = Object.keys(config.repos);
 
   let hasMainSetup = false;
   for (const repoName of repoNames) {
     const repoConfig = config.repos[repoName];
-    if (repoConfig.mainSetup && repoConfig.mainSetup.length > 0) {
+    const mainSetup =
+      repoConfig.mainSetup !== undefined ? repoConfig.mainSetup : config.repoDefaults?.mainSetup;
+    if (mainSetup && mainSetup.length > 0) {
       hasMainSetup = true;
       break;
     }
@@ -202,11 +199,12 @@ async function runMainSetup(reposDir: string): Promise<void> {
   console.log('\nRunning main setup on repos...');
   for (const repoName of repoNames) {
     const repoConfig = config.repos[repoName];
-    const mainSetup = repoConfig.mainSetup;
+    const mainSetup =
+      repoConfig.mainSetup !== undefined ? repoConfig.mainSetup : config.repoDefaults?.mainSetup;
     if (!mainSetup || mainSetup.length === 0) continue;
 
     const repoPath = path.join(reposDir, repoName);
-    const shellInitCmd = repoConfig.shellInit ?? config.shellInit;
+    const shellInitCmd = repoConfig.shellInit ?? config.repoDefaults?.shellInit;
     const shellInit = shellInitCmd ? `${shellInitCmd} && ` : '';
 
     console.log(`  ${repoName}:`);
@@ -229,12 +227,13 @@ async function runMainSetup(reposDir: string): Promise<void> {
  * Uses the batch PR data we already fetched (efficient)
  */
 async function cleanupStaleWorktrees(
+  worktreeBasePath: string,
   reposDir: string,
   repoNames: string[],
   prsByRepo: Map<string, Map<string, ExistingPR>>
 ): Promise<void> {
   try {
-    const entries = await fs.readdir(CONFIG.worktreeBasePath, { withFileTypes: true });
+    const entries = await fs.readdir(worktreeBasePath, { withFileTypes: true });
     const worktreeDirs = entries.filter(
       (e) => e.isDirectory() && e.name.startsWith('remove-flag-')
     );
@@ -246,7 +245,7 @@ async function cleanupStaleWorktrees(
     for (const dir of worktreeDirs) {
       // Extract flag key from directory name (remove-flag-{flagKey})
       const flagKey = dir.name.replace('remove-flag-', '');
-      const workspacePath = path.join(CONFIG.worktreeBasePath, dir.name);
+      const workspacePath = path.join(worktreeBasePath, dir.name);
 
       // Check if any repo still has an open PR for this flag (using cached data)
       let hasOpenPR = false;
@@ -295,11 +294,12 @@ async function cleanupStaleWorktrees(
  */
 async function filterFlagsWithExistingPRs(
   flags: FlagToRemove[],
-  reposDir: string,
+  configContext: ConfigContext,
   dryRun: boolean
 ): Promise<{ flagsToProcess: FlagToRemove[]; skippedFlags: FlagResult[] }> {
-  const repoConfig = await readConfig(reposDir);
+  const { reposDir, config: repoConfig } = configContext;
   const repoNames = Object.keys(repoConfig.repos);
+  const worktreeBasePath = repoConfig.worktrees?.basePath ?? CONFIG.worktreeBasePath;
 
   // Fetch all flag PRs from all repos in parallel (much faster than per-flag queries)
   const prsByRepo = new Map<string, Map<string, ExistingPR>>();
@@ -323,7 +323,7 @@ async function filterFlagsWithExistingPRs(
 
   // Clean up stale worktrees using the PR data we just fetched
   if (!dryRun) {
-    await cleanupStaleWorktrees(reposDir, repoNames, prsByRepo);
+    await cleanupStaleWorktrees(worktreeBasePath, reposDir, repoNames, prsByRepo);
   }
 
   const flagsToProcess: FlagToRemove[] = [];
@@ -373,12 +373,12 @@ async function filterFlagsWithExistingPRs(
  * has code references (an upper bound on how many PRs that flag can create).
  * If the agent produces fewer PRs than reserved, we refund the unused budget so
  * we can keep processing more flags. In dry-run mode, we treat reserved budget
- * as spent so `--max-prs` still caps the amount of work performed.
+ * as spent so `maxPrs` still caps the amount of work performed.
  */
 async function processFlags(
   flagsToRun: FlagWithCodeReferences[],
   config: {
-    reposDir: string;
+    configContext: ConfigContext;
     concurrency: number;
     dryRun: boolean;
     maxPrs: number;
@@ -386,8 +386,10 @@ async function processFlags(
   runLogger: { createFlagLogger: (key: string) => Promise<FlagLogger> },
   skippedFlags: FlagResult[]
 ): Promise<{ results: FlagResult[]; remaining: FlagWithCodeReferences[] }> {
-  const byeByeConfig = await readConfig(config.reposDir);
+  const { configContext } = config;
+  const { reposDir, config: byeByeConfig } = configContext;
   const agentKind = byeByeConfig.agent?.type ?? 'claude';
+  const worktreeBasePath = byeByeConfig.worktrees?.basePath ?? CONFIG.worktreeBasePath;
 
   const queue = [...flagsToRun];
   const results: FlagResult[] = [...skippedFlags];
@@ -409,7 +411,7 @@ async function processFlags(
 
     try {
       logger = await runLogger.createFlagLogger(flag.key);
-      const worktreePath = path.join(CONFIG.worktreeBasePath, `remove-flag-${flag.key}`);
+      const worktreePath = path.join(worktreeBasePath, `remove-flag-${flag.key}`);
       console.log(
         `▶ Starting (${agentKind}): ${flag.key} (${config.maxPrs - remainingPrBudget}/${config.maxPrs} PRs reserved)`
       );
@@ -423,7 +425,7 @@ async function processFlags(
       const result = await removeFlag({
         flagKey: flag.key,
         keepBranch: flag.keepBranch,
-        reposDir: config.reposDir,
+        configContext,
         dryRun: config.dryRun,
         skipFetch: true,
         logger: createLoggerFromFlagLogger(logger),
@@ -501,7 +503,7 @@ async function processFlags(
     const task = (async () => {
       const prsFromFlag = await processOneFlag(flag);
 
-      // In dry-run mode we never create PRs, but we still want --max-prs to cap how
+      // In dry-run mode we never create PRs, but we still want maxPrs to cap how
       // much work we do. So we treat reserved budget as "spent" and do not refund.
       if (!config.dryRun) {
         const unused = reserved - prsFromFlag;
@@ -554,15 +556,16 @@ function createLoggerFromFlagLogger(flagLogger: FlagLogger) {
  */
 export async function run(config: OrchestratorConfig): Promise<RunSummary> {
   const startTime = new Date();
-  const concurrency = config.concurrency ?? DEFAULT_CONCURRENCY;
-  const maxPrs = config.maxPrs ?? DEFAULT_MAX_PRS;
-  const logDir = config.logDir ?? DEFAULT_LOG_DIR;
+  const { configContext } = config;
+  const { reposDir } = configContext;
+  const runtime = getRuntimeSettings(configContext.config);
+  const { concurrency, maxPrs, logDir } = runtime;
   const dryRun = config.dryRun ?? false;
 
   console.log(`\n${'═'.repeat(60)}`);
   console.log('                    bye-bye-flag Orchestrator');
   console.log(`${'═'.repeat(60)}`);
-  console.log(`Repos directory: ${config.reposDir}`);
+  console.log(`Repos directory: ${reposDir}`);
   console.log(`Concurrency: ${concurrency}`);
   console.log(`Max PRs: ${maxPrs}`);
   console.log(`Dry run: ${dryRun}`);
@@ -574,8 +577,8 @@ export async function run(config: OrchestratorConfig): Promise<RunSummary> {
 
   // Fetch latest from git and run main setup
   if (!dryRun) {
-    await fetchAllRepos(config.reposDir);
-    await runMainSetup(config.reposDir);
+    await fetchAllRepos(configContext);
+    await runMainSetup(configContext);
   }
 
   // Fetch flags from feature flag system
@@ -589,33 +592,67 @@ export async function run(config: OrchestratorConfig): Promise<RunSummary> {
 
   if (flags.length === 0) {
     console.log('No stale flags found. Nothing to do.');
-    const summary = createSummary(startTime, config, flags, [], runLogger.runDir, 0);
+    const summary = createSummary(
+      startTime,
+      config.fetcher.type,
+      flags,
+      [],
+      runLogger.runDir,
+      0,
+      runtime,
+      dryRun
+    );
     await runLogger.writeSummary(summary);
     return summary;
   }
 
   // Filter out flags with existing open PRs
   console.log('Checking for existing PRs...');
-  const { flagsToProcess: flagsAfterPrCheck, skippedFlags } = await filterFlagsWithExistingPRs(flags, config.reposDir, dryRun);
+  const { flagsToProcess: flagsAfterPrCheck, skippedFlags } = await filterFlagsWithExistingPRs(
+    flags,
+    configContext,
+    dryRun
+  );
 
   console.log(`  ${flagsAfterPrCheck.length} flags passed PR check (${skippedFlags.length} skipped)\n`);
 
   if (flagsAfterPrCheck.length === 0) {
     console.log('No flags to process after PR filtering. Nothing to do.');
-    const summary = createSummary(startTime, config, flags, skippedFlags, runLogger.runDir, 0);
+    const summary = createSummary(
+      startTime,
+      config.fetcher.type,
+      flags,
+      skippedFlags,
+      runLogger.runDir,
+      0,
+      runtime,
+      dryRun
+    );
     await runLogger.writeSummary(summary);
     return summary;
   }
 
   // Filter out flags with no code references
-  const { flagsWithCode, flagsWithoutCode } = await filterFlagsWithCodeReferences(flagsAfterPrCheck, config.reposDir);
+  const { flagsWithCode, flagsWithoutCode } = await filterFlagsWithCodeReferences(
+    flagsAfterPrCheck,
+    configContext
+  );
   const allSkipped = [...skippedFlags, ...flagsWithoutCode];
 
   console.log(`  ${flagsWithCode.length} flags have code references (${flagsWithoutCode.length} have no code)\n`);
 
   if (flagsWithCode.length === 0) {
     console.log('No flags with code references to process. Nothing to do.');
-    const summary = createSummary(startTime, config, flags, allSkipped, runLogger.runDir, 0);
+    const summary = createSummary(
+      startTime,
+      config.fetcher.type,
+      flags,
+      allSkipped,
+      runLogger.runDir,
+      0,
+      runtime,
+      dryRun
+    );
     await runLogger.writeSummary(summary);
     return summary;
   }
@@ -623,13 +660,22 @@ export async function run(config: OrchestratorConfig): Promise<RunSummary> {
   // Process flags until we hit maxPrs PRs created
   const { results, remaining } = await processFlags(
     flagsWithCode,
-    { reposDir: config.reposDir, concurrency, dryRun, maxPrs },
+    { configContext, concurrency, dryRun, maxPrs },
     runLogger,
     allSkipped
   );
 
   // Generate summary
-  const summary = createSummary(startTime, config, flags, results, runLogger.runDir, remaining.length);
+  const summary = createSummary(
+    startTime,
+    config.fetcher.type,
+    flags,
+    results,
+    runLogger.runDir,
+    remaining.length,
+    runtime,
+    dryRun
+  );
   await runLogger.writeSummary(summary);
 
   // Print summary
@@ -660,15 +706,16 @@ export async function runWithInput(
  */
 async function runWithFlags(config: OrchestratorConfig, flags: FlagToRemove[]): Promise<RunSummary> {
   const startTime = new Date();
-  const concurrency = config.concurrency ?? DEFAULT_CONCURRENCY;
-  const maxPrs = config.maxPrs ?? DEFAULT_MAX_PRS;
-  const logDir = config.logDir ?? DEFAULT_LOG_DIR;
+  const { configContext } = config;
+  const { reposDir } = configContext;
+  const runtime = getRuntimeSettings(configContext.config);
+  const { concurrency, maxPrs, logDir } = runtime;
   const dryRun = config.dryRun ?? false;
 
   console.log(`\n${'═'.repeat(60)}`);
   console.log('                    bye-bye-flag Orchestrator');
   console.log(`${'═'.repeat(60)}`);
-  console.log(`Repos directory: ${config.reposDir}`);
+  console.log(`Repos directory: ${reposDir}`);
   console.log(`Concurrency: ${concurrency}`);
   console.log(`Max PRs: ${maxPrs}`);
   console.log(`Dry run: ${dryRun}`);
@@ -680,39 +727,73 @@ async function runWithFlags(config: OrchestratorConfig, flags: FlagToRemove[]): 
 
   // Fetch latest from git and run main setup
   if (!dryRun) {
-    await fetchAllRepos(config.reposDir);
-    await runMainSetup(config.reposDir);
+    await fetchAllRepos(configContext);
+    await runMainSetup(configContext);
   }
 
   if (flags.length === 0) {
     console.log('No flags in input. Nothing to do.');
-    const summary = createSummary(startTime, config, flags, [], runLogger.runDir, 0);
+    const summary = createSummary(
+      startTime,
+      config.fetcher.type,
+      flags,
+      [],
+      runLogger.runDir,
+      0,
+      runtime,
+      dryRun
+    );
     await runLogger.writeSummary(summary);
     return summary;
   }
 
   // Filter out flags with existing open PRs
   console.log('\nChecking for existing PRs...');
-  const { flagsToProcess: flagsAfterPrCheck, skippedFlags } = await filterFlagsWithExistingPRs(flags, config.reposDir, dryRun);
+  const { flagsToProcess: flagsAfterPrCheck, skippedFlags } = await filterFlagsWithExistingPRs(
+    flags,
+    configContext,
+    dryRun
+  );
 
   console.log(`  ${flagsAfterPrCheck.length} flags passed PR check (${skippedFlags.length} skipped)\n`);
 
   if (flagsAfterPrCheck.length === 0) {
     console.log('No flags to process after PR filtering. Nothing to do.');
-    const summary = createSummary(startTime, config, flags, skippedFlags, runLogger.runDir, 0);
+    const summary = createSummary(
+      startTime,
+      config.fetcher.type,
+      flags,
+      skippedFlags,
+      runLogger.runDir,
+      0,
+      runtime,
+      dryRun
+    );
     await runLogger.writeSummary(summary);
     return summary;
   }
 
   // Filter out flags with no code references
-  const { flagsWithCode, flagsWithoutCode } = await filterFlagsWithCodeReferences(flagsAfterPrCheck, config.reposDir);
+  const { flagsWithCode, flagsWithoutCode } = await filterFlagsWithCodeReferences(
+    flagsAfterPrCheck,
+    configContext
+  );
   const allSkipped = [...skippedFlags, ...flagsWithoutCode];
 
   console.log(`  ${flagsWithCode.length} flags have code references (${flagsWithoutCode.length} have no code)\n`);
 
   if (flagsWithCode.length === 0) {
     console.log('No flags with code references to process. Nothing to do.');
-    const summary = createSummary(startTime, config, flags, allSkipped, runLogger.runDir, 0);
+    const summary = createSummary(
+      startTime,
+      config.fetcher.type,
+      flags,
+      allSkipped,
+      runLogger.runDir,
+      0,
+      runtime,
+      dryRun
+    );
     await runLogger.writeSummary(summary);
     return summary;
   }
@@ -720,13 +801,22 @@ async function runWithFlags(config: OrchestratorConfig, flags: FlagToRemove[]): 
   // Process flags until we hit maxPrs PRs created
   const { results, remaining } = await processFlags(
     flagsWithCode,
-    { reposDir: config.reposDir, concurrency, dryRun, maxPrs },
+    { configContext, concurrency, dryRun, maxPrs },
     runLogger,
     allSkipped
   );
 
   // Generate summary
-  const summary = createSummary(startTime, config, flags, results, runLogger.runDir, remaining.length);
+  const summary = createSummary(
+    startTime,
+    config.fetcher.type,
+    flags,
+    results,
+    runLogger.runDir,
+    remaining.length,
+    runtime,
+    dryRun
+  );
   await runLogger.writeSummary(summary);
 
   // Print summary
@@ -737,11 +827,13 @@ async function runWithFlags(config: OrchestratorConfig, flags: FlagToRemove[]): 
 
 function createSummary(
   startTime: Date,
-  config: OrchestratorConfig,
+  fetcherType: string,
   allFlags: FlagToRemove[],
   results: FlagResult[],
   logDir: string,
-  remainingCount: number
+  remainingCount: number,
+  runtime: RuntimeSettings,
+  dryRun: boolean
 ): RunSummary {
   const endTime = new Date();
 
@@ -762,12 +854,12 @@ function createSummary(
     startTime: startTime.toISOString(),
     endTime: endTime.toISOString(),
     config: {
-      concurrency: config.concurrency ?? DEFAULT_CONCURRENCY,
-      maxPrs: config.maxPrs ?? DEFAULT_MAX_PRS,
-      dryRun: config.dryRun ?? false,
+      concurrency: runtime.concurrency,
+      maxPrs: runtime.maxPrs,
+      dryRun,
     },
     input: {
-      fetcherType: config.fetcher.type,
+      fetcherType,
       totalFetched: allFlags.length,
       skippedExisting: skipped,
       processed: results.length - skipped,
@@ -802,7 +894,7 @@ function printSummary(summary: RunSummary): void {
   console.log(`  ⊘ ${summary.results.skipped} skipped`);
 
   if (summary.results.remaining > 0) {
-    console.log(`  … ${summary.results.remaining} remaining (--max-prs limit)`);
+    console.log(`  … ${summary.results.remaining} remaining (maxPrs limit)`);
   }
 
   const prsCreatedFlags = summary.flags.filter((f) => f.prUrls && f.prUrls.length > 0);

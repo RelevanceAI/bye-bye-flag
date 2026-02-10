@@ -10,7 +10,7 @@ import { execa } from 'execa';
 import { fetchFlags, type FlagToRemove, type FetcherConfig } from '../fetchers/index.ts';
 import { removeFlag } from '../agent/index.ts';
 import { fetchAllFlagPRs, type ExistingPR } from '../agent/git.ts';
-import { getDefaultBranch } from '../agent/scaffold.ts';
+import { getDefaultBranch, readWorkspaceMetadata } from '../agent/scaffold.ts';
 import { createRunLogger, type FlagLogger, type LogStatus } from './logger.ts';
 import type { RemovalResult } from '../types.ts';
 import { CONFIG } from '../config.ts';
@@ -232,6 +232,30 @@ async function cleanupStaleWorktrees(
   repoNames: string[],
   prsByRepo: Map<string, Map<string, ExistingPR>>
 ): Promise<void> {
+  const normalizePath = async (value: string): Promise<string> => {
+    try {
+      return await fs.realpath(value);
+    } catch {
+      return path.resolve(value);
+    }
+  };
+
+  const getRegisteredWorktrees = async (repoPath: string): Promise<Set<string>> => {
+    const result = await execa('git', ['worktree', 'list', '--porcelain'], {
+      cwd: repoPath,
+      reject: false,
+    });
+    const registered = new Set<string>();
+    if (result.exitCode !== 0) return registered;
+    for (const line of result.stdout.split('\n')) {
+      if (!line.startsWith('worktree ')) continue;
+      const worktree = line.slice('worktree '.length).trim();
+      if (!worktree) continue;
+      registered.add(await normalizePath(worktree));
+    }
+    return registered;
+  };
+
   try {
     const entries = await fs.readdir(worktreeBasePath, { withFileTypes: true });
     const worktreeDirs = entries.filter(
@@ -241,6 +265,14 @@ async function cleanupStaleWorktrees(
     if (worktreeDirs.length === 0) return;
 
     console.log(`\nChecking ${worktreeDirs.length} existing worktree(s) for cleanup...`);
+    const normalizedReposDir = await normalizePath(reposDir);
+    const registeredByRepo = new Map<string, Set<string>>();
+    await Promise.all(
+      repoNames.map(async (repoName) => {
+        const repoPath = path.join(reposDir, repoName);
+        registeredByRepo.set(repoName, await getRegisteredWorktrees(repoPath));
+      })
+    );
 
     for (const dir of worktreeDirs) {
       // Extract flag key from directory name (remove-flag-{flagKey})
@@ -261,21 +293,58 @@ async function cleanupStaleWorktrees(
       if (!hasOpenPR) {
         console.log(`  Cleaning up worktree for "${flagKey}" (PR merged/closed or not found)`);
         try {
-          // Clean up each repo's worktree
+          const metadata = await readWorkspaceMetadata(workspacePath);
+          const metadataReposDir =
+            metadata && typeof metadata.reposDir === 'string'
+              ? await normalizePath(metadata.reposDir)
+              : null;
+          const workspaceOwnedByCurrentRun = metadataReposDir === normalizedReposDir;
+
+          if (metadata && !workspaceOwnedByCurrentRun) {
+            console.log(`  Skipping "${flagKey}" (workspace belongs to another repos root)`);
+            continue;
+          }
+
+          const registeredForCurrentRepos: Array<{ repoName: string; worktreePath: string }> = [];
           for (const repoName of repoNames) {
-            const repoPath = path.join(reposDir, repoName);
             const worktreePath = path.join(workspacePath, repoName);
-            try {
-              await execa('git', ['worktree', 'remove', worktreePath, '--force'], {
-                cwd: repoPath,
-                reject: false,
-              });
-            } catch {
-              // Ignore errors
+            const normalizedWorktreePath = await normalizePath(worktreePath);
+            if (registeredByRepo.get(repoName)?.has(normalizedWorktreePath)) {
+              registeredForCurrentRepos.push({ repoName, worktreePath });
             }
           }
-          // Remove the workspace directory
-          await fs.rm(workspacePath, { recursive: true, force: true });
+
+          if (!workspaceOwnedByCurrentRun && registeredForCurrentRepos.length === 0) {
+            // Legacy workspace (no metadata) or foreign directory that is not registered
+            // in the current clone's worktree list. Never delete this folder.
+            console.log(`  Skipping "${flagKey}" (not registered to current repos clone)`);
+            continue;
+          }
+
+          let removalFailed = false;
+          // Clean up each repo's worktree
+          for (const { repoName, worktreePath } of registeredForCurrentRepos) {
+            const repoPath = path.join(reposDir, repoName);
+            const removeResult = await execa('git', ['worktree', 'remove', worktreePath, '--force'], {
+              cwd: repoPath,
+              reject: false,
+            });
+            if (removeResult.exitCode !== 0) {
+              removalFailed = true;
+              console.warn(
+                `  Warning: Failed to remove worktree "${worktreePath}" from ${repoName}; leaving workspace untouched`
+              );
+            }
+          }
+
+          if (removalFailed) {
+            continue;
+          }
+
+          if (workspaceOwnedByCurrentRun || registeredForCurrentRepos.length > 0) {
+            // Remove workspace only after registered worktrees were removed successfully.
+            await fs.rm(workspacePath, { recursive: true, force: true });
+          }
         } catch {
           // Ignore cleanup errors
         }
@@ -426,6 +495,7 @@ async function processFlags(
         flagKey: flag.key,
         keepBranch: flag.keepBranch,
         configContext,
+        flagCreatedBy: flag.createdBy,
         dryRun: config.dryRun,
         skipFetch: true,
         logger: createLoggerFromFlagLogger(logger),
@@ -446,19 +516,26 @@ async function processFlags(
           console.log(`○ Complete: ${flag.key} (no changes needed, ${formatDuration(durationMs)})`);
           await logger.finish('complete', 'No changes needed');
         }
-        results.push({ key: flag.key, status: 'complete', result, prUrls, durationMs });
+        results.push({ key: flag.key, status: 'complete', result, prUrls, durationMs, createdBy: flag.createdBy });
         return prUrls.length;
       } else if (result.status === 'refused') {
         consecutiveFailures = 0;
         console.log(`⊘ Skipped: ${flag.key} (${result.refusalReason})`);
         await logger.finish('skipped', result.refusalReason);
-        results.push({ key: flag.key, status: 'skipped', result, skippedReason: result.refusalReason, durationMs });
+        results.push({
+          key: flag.key,
+          status: 'skipped',
+          result,
+          skippedReason: result.refusalReason,
+          durationMs,
+          createdBy: flag.createdBy,
+        });
         return 0;
       } else {
         consecutiveFailures++;
         console.log(`✗ Failed: ${flag.key} (${result.error})`);
         await logger.finish('failed', result.error);
-        results.push({ key: flag.key, status: 'failed', result, error: result.error, durationMs });
+        results.push({ key: flag.key, status: 'failed', result, error: result.error, durationMs, createdBy: flag.createdBy });
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
           console.log(`\n⚠ Stopping: ${MAX_CONSECUTIVE_FAILURES} consecutive failures (likely systemic issue)`);
           shouldStop = true;
@@ -474,7 +551,7 @@ async function processFlags(
         logger.error(errorMsg);
         await logger.finish('failed', errorMsg);
       }
-      results.push({ key: flag.key, status: 'failed', error: errorMsg, durationMs });
+      results.push({ key: flag.key, status: 'failed', error: errorMsg, durationMs, createdBy: flag.createdBy });
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
         console.log(`\n⚠ Stopping: ${MAX_CONSECUTIVE_FAILURES} consecutive failures (likely systemic issue)`);
         shouldStop = true;

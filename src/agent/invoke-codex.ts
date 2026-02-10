@@ -9,7 +9,7 @@ import { registerChildProcess } from '../process-tracker.ts';
 import { getShellInit } from './scaffold.ts';
 
 const UUID_RE =
-  /\b[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\b/i;
+  /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/i;
 
 const MAX_EVENT_LOG_CHARS = 3000;
 
@@ -27,6 +27,15 @@ function buildAgentOutputJsonSchema(): unknown {
       testsPass: { type: 'boolean' },
       lintPass: { type: 'boolean' },
       typecheckPass: { type: 'boolean' },
+      verificationDetails: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          tests: { type: 'string' },
+          lint: { type: 'string' },
+          typecheck: { type: 'string' },
+        },
+      },
     },
   };
 }

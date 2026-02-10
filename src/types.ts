@@ -59,6 +59,13 @@ export const AgentOutputSchema = z.object({
   testsPass: z.boolean(),
   lintPass: z.boolean(),
   typecheckPass: z.boolean(),
+  verificationDetails: z
+    .object({
+      tests: z.string().optional(),
+      lint: z.string().optional(),
+      typecheck: z.string().optional(),
+    })
+    .optional(),
 });
 
 export type AgentOutput = z.infer<typeof AgentOutputSchema>;

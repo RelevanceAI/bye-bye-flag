@@ -106,11 +106,17 @@ If you forget (long/complex tasks sometimes cause context rot), that's okay — 
   "filesChanged": ["array", "of", "file", "paths"],
   "testsPass": true/false,
   "lintPass": true/false,
-  "typecheckPass": true/false
+  "typecheckPass": true/false,
+  "verificationDetails": {
+    "tests": "optional brief failure detail (only when testsPass=false)",
+    "lint": "optional brief failure detail (only when lintPass=false)",
+    "typecheck": "optional brief failure detail (only when typecheckPass=false)"
+  }
 }
 
 Rules:
 - If tests/lint/typecheck were skipped or not run, set them to `true`.
+- Only include `verificationDetails` entries for checks that failed.
 - If you refuse (e.g. flag not found / too risky), use `"status": "refused"` and explain in `summary`.
 
 ## Important Rules

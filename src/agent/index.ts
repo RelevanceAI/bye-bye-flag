@@ -18,6 +18,7 @@ import type { ConfigContext } from '../config-context.ts';
 
 export interface RemoveFlagOptions extends RemovalRequest {
   configContext: ConfigContext;
+  flagCreatedBy?: string;
   logger?: Logger; // Optional logger (defaults to console)
   // Internal: used by orchestrator to skip redundant preflight checks.
   skipFetch?: boolean;
@@ -160,7 +161,15 @@ async function checkPrerequisites(
  * Operates on a directory containing bye-bye-flag-config.json and one or more git repos
  */
 export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalResult> {
-  const { flagKey, keepBranch, dryRun, keepWorktree, configContext, logger = consoleLogger } =
+  const {
+    flagKey,
+    keepBranch,
+    dryRun,
+    keepWorktree,
+    configContext,
+    flagCreatedBy,
+    logger = consoleLogger,
+  } =
     options;
   const { reposDir, configPath, config } = configContext;
   const branchName = `${CONFIG.branchPrefix}${flagKey}`;
@@ -359,7 +368,8 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
       agentOutput,
       agentKind,
       agentSessionId,
-      scaffoldResult.workspacePath
+      scaffoldResult.workspacePath,
+      flagCreatedBy
     );
 
     const successCount = repoResults.filter((r) => r.status === 'success').length;

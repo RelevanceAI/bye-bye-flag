@@ -178,6 +178,18 @@ function hasVariants(flag: PostHogFlag): boolean {
   return Boolean(variants && variants.length > 0);
 }
 
+function extractCreatorIdentifier(user: PostHogUser | null): string | null {
+  if (!user) return null;
+  if (user.email) {
+    const localPart = user.email.split('@')[0];
+    return localPart || user.email;
+  }
+  if (user.first_name || user.last_name) {
+    return [user.first_name, user.last_name].filter(Boolean).join(' ');
+  }
+  return null;
+}
+
 function analyzeFlagsAcrossProjects(
   flagsByProject: Map<string, PostHogFlag[]>,
   staleDays: number
@@ -190,16 +202,7 @@ function analyzeFlagsAcrossProjects(
 
   for (const [projectId, flags] of flagsByProject) {
     for (const flag of flags) {
-      // Format creator name (prefer "First Last", fallback to email)
-      let createdBy: string | null = null;
-      if (flag.created_by) {
-        const { first_name, last_name, email } = flag.created_by;
-        if (first_name || last_name) {
-          createdBy = [first_name, last_name].filter(Boolean).join(' ');
-        } else {
-          createdBy = email;
-        }
-      }
+      const createdBy = extractCreatorIdentifier(flag.created_by);
 
       const info: FlagInfo = {
         key: flag.key,
@@ -271,8 +274,9 @@ function analyzeFlagsAcrossProjects(
       ? `Inactive for ${daysSinceModified} days`
       : `${rollout}% rollout for ${daysSinceModified} days`;
 
-    // Use the first non-null creator (should be consistent across projects)
-    const createdBy = infos.find((i) => i.createdBy)?.createdBy || undefined;
+    // Include all distinct creators when flags differ across projects/environments.
+    const creators = [...new Set(infos.map((i) => i.createdBy).filter((creator): creator is string => Boolean(creator)))];
+    const createdBy = creators.length > 0 ? creators.join(', ') : undefined;
 
     staleFlags.push({
       key,

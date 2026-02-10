@@ -27,6 +27,79 @@ export interface ScaffoldResult {
   }>;
 }
 
+interface WorkspaceMetadata {
+  createdBy: 'bye-bye-flag';
+  reposDir: string;
+  branchName: string;
+  createdAt: string;
+}
+
+const WORKSPACE_METADATA_FILENAME = '.bye-bye-flag-workspace.json';
+const repoOperationLocks = new Map<string, Promise<void>>();
+
+async function withRepoOperationLock<T>(repoPath: string, action: () => Promise<T>): Promise<T> {
+  const key = path.resolve(repoPath);
+  const previous = (repoOperationLocks.get(key) ?? Promise.resolve()).catch(() => undefined);
+  let release: (() => void) | undefined;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const tail = previous.then(() => current);
+  repoOperationLocks.set(key, tail);
+
+  await previous;
+  try {
+    return await action();
+  } finally {
+    release?.();
+    if (repoOperationLocks.get(key) === tail) {
+      repoOperationLocks.delete(key);
+    }
+  }
+}
+
+async function writeWorkspaceMetadata(
+  workspacePath: string,
+  reposDir: string,
+  branchName: string
+): Promise<void> {
+  const metadata: WorkspaceMetadata = {
+    createdBy: 'bye-bye-flag',
+    reposDir: path.resolve(reposDir),
+    branchName,
+    createdAt: new Date().toISOString(),
+  };
+  await fs.writeFile(
+    path.join(workspacePath, WORKSPACE_METADATA_FILENAME),
+    JSON.stringify(metadata, null, 2),
+    'utf-8'
+  );
+}
+
+export async function readWorkspaceMetadata(workspacePath: string): Promise<WorkspaceMetadata | null> {
+  const metadataPath = path.join(workspacePath, WORKSPACE_METADATA_FILENAME);
+  try {
+    const raw = await fs.readFile(metadataPath, 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<WorkspaceMetadata>;
+    if (
+      parsed.createdBy !== 'bye-bye-flag' ||
+      typeof parsed.reposDir !== 'string' ||
+      typeof parsed.branchName !== 'string' ||
+      typeof parsed.createdAt !== 'string'
+    ) {
+      return null;
+    }
+    return {
+      createdBy: 'bye-bye-flag',
+      reposDir: parsed.reposDir,
+      branchName: parsed.branchName,
+      createdAt: parsed.createdAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Creates worktrees for all git repos configured in bye-bye-flag-config.json
  * Returns a workspace root containing all worktrees
@@ -41,6 +114,7 @@ export async function setupMultiRepoWorktrees(
 
   // Ensure workspace path exists
   await fs.mkdir(workspacePath, { recursive: true });
+  await writeWorkspaceMetadata(workspacePath, reposDir, branchName);
 
   // Validate repos
   const configuredRepos = Object.keys(config.repos);
@@ -76,28 +150,37 @@ export async function setupMultiRepoWorktrees(
     const repoPath = path.join(reposDir, repoName);
     const worktreePath = path.join(workspacePath, repoName);
 
-    // Clean up existing worktree if present
-    try {
-      await fs.access(worktreePath);
-      logger.log(`[${repoName}] Cleaning up existing worktree...`);
-      await execa('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: repoPath });
-    } catch {
-      // Doesn't exist, fine
-    }
+    await withRepoOperationLock(repoPath, async () => {
+      // Clean up existing worktree if present
+      try {
+        await fs.access(worktreePath);
+        logger.log(`[${repoName}] Cleaning up existing worktree...`);
+        await execa('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: repoPath });
+      } catch {
+        // Doesn't exist, fine
+      }
 
-    // Delete existing branch if it exists (local and remote) so we start fresh
-    // Using reject: false so these won't throw even if branch doesn't exist
-    await execa('git', ['branch', '-D', branchName], { cwd: repoPath, reject: false });
-    if (deleteRemoteBranch) {
-      await execa('git', ['push', 'origin', '--delete', branchName], { cwd: repoPath, reject: false });
-    }
+      // Delete existing branch if it exists (local and remote) so we start fresh
+      // Using reject: false so these won't throw even if branch doesn't exist
+      await execa('git', ['branch', '-D', branchName], { cwd: repoPath, reject: false });
+      if (deleteRemoteBranch) {
+        await execa('git', ['push', 'origin', '--delete', branchName], {
+          cwd: repoPath,
+          reject: false,
+        });
+      }
 
-    // Get default branch (already fetched in removeFlag before scaffolding)
-    const defaultBranch = await getDefaultBranch(repoPath);
+      // Get default branch (already fetched in removeFlag before scaffolding)
+      const defaultBranch = await getDefaultBranch(repoPath);
 
-    // Create worktree with the new branch based on origin's default branch
-    logger.log(`[${repoName}] Creating worktree on branch ${branchName}...`);
-    await execa('git', ['worktree', 'add', '-b', branchName, worktreePath, `origin/${defaultBranch}`], { cwd: repoPath });
+      // Create worktree with the new branch based on origin's default branch
+      logger.log(`[${repoName}] Creating worktree on branch ${branchName}...`);
+      await execa(
+        'git',
+        ['worktree', 'add', '-b', branchName, worktreePath, `origin/${defaultBranch}`],
+        { cwd: repoPath }
+      );
+    });
 
     // Setup node and run setup commands
     logger.log(`[${repoName}] Running setup commands...`);

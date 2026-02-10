@@ -299,11 +299,17 @@ async function normalizeOutput(rawOutput: string, cwd: string, logger: Logger): 
   "filesChanged": ["array", "of", "file", "paths"],
   "testsPass": true/false,
   "lintPass": true/false,
-  "typecheckPass": true/false
+  "typecheckPass": true/false,
+  "verificationDetails": {
+    "tests": "optional brief failure detail (only when testsPass=false)",
+    "lint": "optional brief failure detail (only when lintPass=false)",
+    "typecheck": "optional brief failure detail (only when typecheckPass=false)"
+  }
 }
 
 If tests/lint/typecheck were skipped or not run, set them to true.
 If the task was refused (e.g., flag not found), use status "refused".
+Omit verificationDetails keys that are not relevant.
 
 Here is the output to convert (may be truncated in the middle if very long):
 

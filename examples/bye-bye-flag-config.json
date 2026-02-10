@@ -11,10 +11,12 @@
   },
   "repoDefaults": {
     "shellInit": "source ~/.nvm/nvm.sh && nvm use",
+    "baseBranch": "main",
     "setup": ["pnpm install"]
   },
   "repos": {
     "my-repo": {
+      "baseBranch": "main"
     }
   }
 }

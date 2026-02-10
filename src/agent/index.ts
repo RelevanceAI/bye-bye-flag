@@ -6,8 +6,9 @@ import { consoleLogger, type AgentKind, type Logger, type RemovalRequest, type R
 import {
   setupMultiRepoWorktrees,
   cleanupMultiRepoWorktrees,
-  getDefaultBranch,
+  getRepoBaseBranch,
   type ScaffoldResult,
+  type ByeByeFlagConfig,
 } from './scaffold.ts';
 import { generatePrompt, readContextFiles } from './prompt.ts';
 import { invokeClaudeCode } from './invoke.ts';
@@ -43,12 +44,11 @@ async function fetchAllRepos(configContext: ConfigContext): Promise<void> {
 }
 
 /**
- * Check if a flag exists in a single git repo using git grep on origin's default branch
+ * Check if a flag exists in a single git repo using git grep on the configured base branch
  */
-async function flagExistsInRepo(repoPath: string, pattern: string): Promise<boolean> {
-  const defaultBranch = await getDefaultBranch(repoPath);
-  // Search on origin/defaultBranch to check the latest remote code
-  const result = await execa('git', ['grep', '-lE', pattern, `origin/${defaultBranch}`], {
+async function flagExistsInRepo(repoPath: string, pattern: string, baseBranch: string): Promise<boolean> {
+  // Search on origin/baseBranch to check the latest remote code
+  const result = await execa('git', ['grep', '-lE', pattern, `origin/${baseBranch}`], {
     cwd: repoPath,
     reject: false,
   });
@@ -59,7 +59,11 @@ async function flagExistsInRepo(repoPath: string, pattern: string): Promise<bool
  * Check if a flag exists in the codebase using git grep (respects .gitignore)
  * Searches each repo subdirectory in the workspace
  */
-async function flagExistsInCodebase(workspacePath: string, flagKey: string): Promise<boolean> {
+async function flagExistsInCodebase(
+  workspacePath: string,
+  flagKey: string,
+  config: ByeByeFlagConfig
+): Promise<boolean> {
   try {
     // Escape regex special characters in the flag key
     const escapedKey = flagKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -70,13 +74,14 @@ async function flagExistsInCodebase(workspacePath: string, flagKey: string): Pro
     const entries = await fs.readdir(workspacePath, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-      const repoPath = path.join(workspacePath, entry.name);
-      try {
-        await fs.access(path.join(repoPath, '.git'));
-        if (await flagExistsInRepo(repoPath, pattern)) {
-          return true;
-        }
-      } catch {
+        const repoPath = path.join(workspacePath, entry.name);
+        try {
+          await fs.access(path.join(repoPath, '.git'));
+          const baseBranch = getRepoBaseBranch(config, entry.name);
+          if (await flagExistsInRepo(repoPath, pattern, baseBranch)) {
+            return true;
+          }
+        } catch {
         // Not a git repo, skip
       }
     }
@@ -231,7 +236,7 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
 
     // Check if flag exists in any repo BEFORE scaffolding (saves time if flag not found)
     logger.log(`Checking if flag "${flagKey}" exists in codebase...`);
-    const flagExists = await flagExistsInCodebase(reposDir, flagKey);
+    const flagExists = await flagExistsInCodebase(reposDir, flagKey, config);
     if (!flagExists) {
       logger.log(`Flag "${flagKey}" not found in any repository. Safe to remove from feature flag system.`);
       return {

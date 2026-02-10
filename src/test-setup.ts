@@ -13,7 +13,7 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { execa } from 'execa';
 import { CONFIG } from './config.ts';
-import { getDefaultBranch, type ByeByeFlagConfig } from './agent/scaffold.ts';
+import { getRepoBaseBranch, type ByeByeFlagConfig } from './agent/scaffold.ts';
 import { loadEnvFileIfExists } from './env.ts';
 import { loadConfigContext } from './config-context.ts';
 
@@ -85,11 +85,11 @@ async function testRepo(
   console.log(`  Path: ${worktreePath}`);
 
   try {
-    const defaultBranch = await getDefaultBranch(repoPath);
+    const baseBranch = getRepoBaseBranch(config, repoName);
 
     // Create worktree
     await fs.mkdir(path.dirname(worktreePath), { recursive: true });
-    await execa('git', ['worktree', 'add', '-b', testBranch, worktreePath, `origin/${defaultBranch}`], {
+    await execa('git', ['worktree', 'add', '-b', testBranch, worktreePath, `origin/${baseBranch}`], {
       cwd: repoPath,
       stdio: 'inherit',
     });

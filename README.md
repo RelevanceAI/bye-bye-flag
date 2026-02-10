@@ -159,14 +159,17 @@ Example files are available in `examples/`.
     "logDir": "./bye-bye-flag-logs"
   },
   "repoDefaults": {
-    "shellInit": "source ~/.nvm/nvm.sh && nvm use"
+    "shellInit": "source ~/.nvm/nvm.sh && nvm use",
+    "baseBranch": "main"
   },
   "repos": {
     "my-api": {
+      "baseBranch": "development",
       "setup": ["pnpm install", "pnpm run codegen"]
     },
     "my-frontend": {
       "shellInit": "source ~/.asdf/asdf.sh",
+      "baseBranch": "main",
       "setup": ["pnpm install"]
     }
   }
@@ -210,9 +213,12 @@ Example:
 ### Repo Configuration
 
 - `repoDefaults.shellInit` (optional): Default command to run before each shell command (setup and agent)
+- `repoDefaults.baseBranch` (optional): Shared base branch for worktree creation and code search
 - `repoDefaults.mainSetup` (optional): Default mainSetup commands (applied to every repo unless overridden)
 - `repoDefaults.setup`: Default setup commands for worktrees (recommended)
 - `repos.<name>.shellInit` (optional): Override shellInit for a specific repo
+- `repos.<name>.baseBranch` (optional): Override base branch for a specific repo (for example `development`)
+- `baseBranch` is required for every repo via either `repoDefaults.baseBranch` or `repos.<name>.baseBranch` (no implicit fallback)
 - `repos.<name>.mainSetup` (optional): Override mainSetup commands for a repo
 - `repos.<name>.setup` (optional): Override setup commands for a repo (supports `${MAIN_REPO}` substitution)
 
@@ -221,6 +227,7 @@ Example:
 ```json
 {
   "repoDefaults": {
+    "baseBranch": "main",
     "setup": ["pnpm install"]
   },
   "repos": {

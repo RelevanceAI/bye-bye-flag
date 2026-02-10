@@ -170,14 +170,13 @@ export async function setupMultiRepoWorktrees(
         });
       }
 
-      // Get default branch (already fetched in removeFlag before scaffolding)
-      const defaultBranch = await getDefaultBranch(repoPath);
+      const baseBranch = getRepoBaseBranch(config, repoName);
 
-      // Create worktree with the new branch based on origin's default branch
+      // Create worktree with the new branch based on the configured origin base branch
       logger.log(`[${repoName}] Creating worktree on branch ${branchName}...`);
       await execa(
         'git',
-        ['worktree', 'add', '-b', branchName, worktreePath, `origin/${defaultBranch}`],
+        ['worktree', 'add', '-b', branchName, worktreePath, `origin/${baseBranch}`],
         { cwd: repoPath }
       );
     });
@@ -237,29 +236,10 @@ export async function cleanupMultiRepoWorktrees(result: ScaffoldResult): Promise
   }
 }
 
-/**
- * Gets the default branch name (main or master)
- */
-export async function getDefaultBranch(repoPath: string): Promise<string> {
-  try {
-    const { stdout } = await execa('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], {
-      cwd: repoPath,
-    });
-    return stdout.replace('refs/remotes/origin/', '').trim();
-  } catch {
-    // Fallback: check if origin/main or origin/master exists
-    try {
-      await execa('git', ['rev-parse', '--verify', 'origin/main'], { cwd: repoPath });
-      return 'main';
-    } catch {
-      return 'master';
-    }
-  }
-}
-
 const RepoEntrySchema = z
   .object({
     shellInit: z.string().optional(), // Override shell init for this repo
+    baseBranch: z.string().min(1).optional(), // Base branch for worktree creation + code search
     mainSetup: z.array(z.string()).optional(), // Setup commands for main repo (run once by orchestrator)
     setup: z.array(z.string()).optional(), // Setup commands for worktrees (run per flag)
   })
@@ -282,6 +262,7 @@ const WorktreesSchema = z
 const RepoDefaultsSchema = z
   .object({
     shellInit: z.string().optional(),
+    baseBranch: z.string().min(1).optional(),
     mainSetup: z.array(z.string()).optional(),
     setup: z.array(z.string()).optional(),
   })
@@ -355,10 +336,36 @@ const ByeByeFlagConfigSchema = z
           message: 'Missing setup commands. Set repos.<name>.setup or repoDefaults.setup.',
         });
       }
+
+      const hasBaseBranch =
+        (typeof repoCfg.baseBranch === 'string' && repoCfg.baseBranch.trim().length > 0) ||
+        (typeof cfg.repoDefaults?.baseBranch === 'string' &&
+          cfg.repoDefaults.baseBranch.trim().length > 0);
+      if (!hasBaseBranch) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['repos', repoName, 'baseBranch'],
+          message: 'Missing baseBranch. Set repos.<name>.baseBranch or repoDefaults.baseBranch.',
+        });
+      }
     }
   });
 
 export type ByeByeFlagConfig = z.infer<typeof ByeByeFlagConfigSchema>;
+
+export function getRepoBaseBranch(config: ByeByeFlagConfig, repoName: string): string {
+  const repoConfig = config.repos[repoName];
+  if (!repoConfig) {
+    throw new Error(`No config entry for repo "${repoName}" in bye-bye-flag-config.json`);
+  }
+  const baseBranch = repoConfig.baseBranch ?? config.repoDefaults?.baseBranch;
+  if (!baseBranch || baseBranch.trim().length === 0) {
+    throw new Error(
+      `Missing baseBranch for repo "${repoName}". Set repos.${repoName}.baseBranch or repoDefaults.baseBranch.`
+    );
+  }
+  return baseBranch;
+}
 
 let cachedConfig: ByeByeFlagConfig | null = null;
 let cachedConfigPath: string | null = null;

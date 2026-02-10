@@ -51,12 +51,17 @@ Configuration (bye-bye-flag-config.json):
       "logDir": "./bye-bye-flag-logs"
     },
     "repoDefaults": {
+      "baseBranch": "main",
       "setup": ["pnpm install"]
     },
     "repos": {
-      "my-repo": {}
+      "my-repo": {
+        "baseBranch": "main"
+      }
     }
   }
+
+  Note: Set baseBranch explicitly via repoDefaults.baseBranch or repos.<name>.baseBranch.
 
 Examples:
   # Run the orchestrator (fetches stale flags and processes them)

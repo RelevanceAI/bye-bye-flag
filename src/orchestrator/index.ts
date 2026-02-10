@@ -10,7 +10,7 @@ import { execa } from 'execa';
 import { fetchFlags, type FlagToRemove, type FetcherConfig } from '../fetchers/index.ts';
 import { removeFlag } from '../agent/index.ts';
 import { fetchAllFlagPRs, type ExistingPR } from '../agent/git.ts';
-import { getDefaultBranch, readWorkspaceMetadata } from '../agent/scaffold.ts';
+import { getRepoBaseBranch, readWorkspaceMetadata } from '../agent/scaffold.ts';
 import { createRunLogger, type FlagLogger, type LogStatus } from './logger.ts';
 import type { RemovalResult } from '../types.ts';
 import { CONFIG } from '../config.ts';
@@ -63,7 +63,7 @@ export interface RunSummary {
 type FlagWithCodeReferences = FlagToRemove & { reposWithCode: string[] };
 
 /**
- * Check if a flag exists in a single git repo using git grep on origin's default branch
+ * Check if a flag exists in a single git repo using git grep on the configured base branch
  */
 async function flagExistsInRepo(
   repoPath: string,
@@ -75,7 +75,7 @@ async function flagExistsInRepo(
   // Search for flag key in quotes (single, double, or backtick) to avoid false positives
   const pattern = `["'\`]${escapedKey}["'\`]`;
 
-  // Search on origin/defaultBranch to check the latest remote code
+  // Search on origin/baseBranch to check the latest remote code
   const result = await execa('git', ['grep', '-lE', pattern, `origin/${defaultBranch}`], {
     cwd: repoPath,
     reject: false,
@@ -99,17 +99,10 @@ async function filterFlagsWithCodeReferences(
   const flagsWithCode: FlagWithCodeReferences[] = [];
   const flagsWithoutCode: FlagResult[] = [];
 
-  const defaultBranchByRepo = new Map<string, string>();
-  await Promise.all(
-    repoNames.map(async (repoName) => {
-      const repoPath = path.join(reposDir, repoName);
-      try {
-        defaultBranchByRepo.set(repoName, await getDefaultBranch(repoPath));
-      } catch {
-        defaultBranchByRepo.set(repoName, 'main');
-      }
-    })
-  );
+  const baseBranchByRepo = new Map<string, string>();
+  for (const repoName of repoNames) {
+    baseBranchByRepo.set(repoName, getRepoBaseBranch(config, repoName));
+  }
 
   // Check each flag in parallel (batch of concurrent checks)
   const BATCH_SIZE = 10;
@@ -123,8 +116,11 @@ async function filterFlagsWithCodeReferences(
         for (const repoName of repoNames) {
           const repoPath = path.join(reposDir, repoName);
           try {
-            const defaultBranch = defaultBranchByRepo.get(repoName) ?? 'main';
-            if (await flagExistsInRepo(repoPath, flag.key, defaultBranch)) {
+            const baseBranch = baseBranchByRepo.get(repoName);
+            if (!baseBranch) {
+              throw new Error(`Missing baseBranch configuration for repo "${repoName}"`);
+            }
+            if (await flagExistsInRepo(repoPath, flag.key, baseBranch)) {
               reposWithCode.push(repoName);
             }
           } catch {

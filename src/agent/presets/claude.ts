@@ -11,7 +11,8 @@ export const claudePreset: AgentPreset = {
     arg: '--session-id',
   },
   resume: {
-    withSessionId: 'cd {{workspacePath}} && {{command}} --resume {{sessionId}}',
-    withoutSessionId: 'cd {{workspacePath}} && {{command}} --resume',
+    withSessionId:
+      'cd {{workspacePath}} && {{command}} --dangerously-skip-permissions --resume {{sessionId}}',
+    withoutSessionId: 'cd {{workspacePath}} && {{command}} --dangerously-skip-permissions --resume',
   },
 };

@@ -1,8 +1,12 @@
 # bye-bye-flag
 
-Remove stale feature flags from codebases using AI.
+**Automatically remove stale feature flags from your codebase using AI coding agents.**
 
-`bye-bye-flag` uses a CLI coding agent to automatically find and remove feature flag conditionals, clean up dead code, and create pull requests.
+Every team accumulates feature flags that outlive their purpose — flags rolled out to 100% months ago, experiments that were killed but never cleaned up, toggles nobody remembers adding. They clutter your code, confuse new developers, and make refactoring harder.
+
+`bye-bye-flag` connects to your feature flag provider (PostHog, with more coming), identifies stale flags, and dispatches an AI coding agent to remove each one — cleaning up conditionals, dead code paths, unused imports, and orphaned tests. It then opens a draft PR for human review.
+
+We built this at [Relevance AI](https://relevanceai.com) and run it against our own production codebases. It's actively maintained and improving.
 
 ## Quick Start
 

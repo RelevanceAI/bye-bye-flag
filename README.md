@@ -4,9 +4,22 @@
 
 Every team accumulates feature flags that outlive their purpose — flags rolled out to 100% months ago, experiments that were killed but never cleaned up, toggles nobody remembers adding. They clutter your code, confuse new developers, and make refactoring harder.
 
-`bye-bye-flag` connects to your feature flag provider (PostHog, with more coming), identifies stale flags, and dispatches an AI coding agent to remove each one — cleaning up conditionals, dead code paths, unused imports, and orphaned tests. It then opens a draft PR for human review.
+`bye-bye-flag` connects to your feature flag provider (PostHog, with more coming), identifies stale flags, and dispatches AI coding agents to remove them **in parallel** — cleaning up conditionals, dead code paths, unused imports, and orphaned tests across multiple repositories. Point it at a backlog of 50 stale flags and walk away; come back to a stack of draft PRs ready for review.
 
 We built this at [Relevance AI](https://relevanceai.com) and run it against our own production codebases. It's actively maintained and improving.
+
+## Prerequisites
+
+- **Node.js 24+** (native TypeScript support)
+- **git**
+- **Agent CLI**: at least one coding-agent CLI in your `PATH`
+  - Built-in adapters: **[Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code)** (`claude`) and **[Codex CLI](https://developers.openai.com/codex/cli/)** (`codex`)
+  - Generic adapter: any CLI command configured via `agent.type`/`agent.command`
+  - macOS: if you installed the **[Codex app](https://openai.com/codex/)**, the CLI binary is bundled at `/Applications/Codex.app/Contents/Resources/codex`. To expose it on your `PATH`:
+    ```bash
+    ln -s /Applications/Codex.app/Contents/Resources/codex ~/.local/bin/codex
+    ```
+- **[GitHub CLI](https://cli.github.com/)**: Required for creating PRs (not needed for `--dry-run`)
 
 ## Quick Start
 
@@ -52,37 +65,11 @@ pnpm start remove --target-repos=./.target-repos --flag=my-flag-key --keep=enabl
 # With a JSON file of flags to remove
 pnpm start run --target-repos=./.target-repos --input=flags.json
 
-# With PostHog (requires POSTHOG_API_KEY in .env)
+# With PostHog (requires POSTHOG_API_KEY in .env — see Environment Variables)
 pnpm start run --target-repos=./.target-repos
 ```
 
 See [examples/](examples/) for sample config and flags files.
-
-## Prerequisites
-
-- **Node.js 24+** (native TypeScript support)
-- **git**
-- **Agent CLI**: at least one coding-agent CLI in your `PATH`
-  - Built-in adapters: **[Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code)** (`claude`) and **[Codex CLI](https://developers.openai.com/codex/cli/)** (`codex`)
-  - Generic adapter: any CLI command configured via `agent.type`/`agent.command`
-  - macOS: if you installed the **[Codex app](https://openai.com/codex/)**, the CLI binary is bundled at `/Applications/Codex.app/Contents/Resources/codex`. To expose it on your `PATH`:
-    ```bash
-    ln -s /Applications/Codex.app/Contents/Resources/codex ~/.local/bin/codex
-    ```
-- **[GitHub CLI](https://cli.github.com/)**: Required for creating PRs (not needed for `--dry-run`)
-
-## Installation
-
-```bash
-git clone https://github.com/RelevanceAI/bye-bye-flag.git
-cd bye-bye-flag
-nvm use
-pnpm install
-
-# Create .env file with secrets (optional if using --input)
-cp .env.example .env
-# Edit .env with your PostHog API key (POSTHOG_API_KEY)
-```
 
 ## Directory Structure
 

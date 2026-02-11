@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { parseAgentOutputFromText, parseDelimitedAgentOutput, RESULT_DELIMITER } from './output.ts';
+import { parseAgentOutputFromText, parseDelimitedAgentOutput, RESULT_DELIMITER } from '../output.ts';
 
 const validOutput = {
   status: 'success' as const,

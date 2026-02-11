@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { getRepoBaseBranch, type ByeByeFlagConfig } from './scaffold.ts';
+import { getRepoBaseBranch, type ByeByeFlagConfig } from '../scaffold.ts';
 
 describe('getRepoBaseBranch', () => {
   it('returns per-repo baseBranch when set', () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { generatePrompt } from './prompt.ts';
+import { generatePrompt } from '../prompt.ts';
 
 describe('generatePrompt', () => {
   it('substitutes flag key and keep branch', async () => {

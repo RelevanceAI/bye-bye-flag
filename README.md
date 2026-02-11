@@ -8,7 +8,9 @@ Remove stale feature flags from codebases using AI.
 
 - **Node.js 24+** (native TypeScript support)
 - **git**
-- **Agent CLI**: either **[Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code)** (`claude`) or **[Codex CLI](https://developers.openai.com/codex/cli/)** (`codex`)
+- **Agent CLI**: at least one coding-agent CLI in your `PATH`
+  - Built-in adapters: **[Claude Code CLI](https://www.npmjs.com/package/@anthropic-ai/claude-code)** (`claude`) and **[Codex CLI](https://developers.openai.com/codex/cli/)** (`codex`)
+  - Generic adapter: any CLI command configured via `agent.type`/`agent.command`
   - macOS: if you installed the **[Codex app](https://openai.com/codex/)**, the CLI binary is bundled at `/Applications/Codex.app/Contents/Resources/codex`. To expose it on your `PATH`:
     ```bash
     ln -s /Applications/Codex.app/Contents/Resources/codex ~/.local/bin/codex
@@ -178,17 +180,41 @@ Example files are available in `examples/`.
 
 ### Agent Configuration
 
-- `agent.type`: Which agent CLI to use (`claude` or `codex`, default: `claude`)
+- `agent.type`: Agent identifier. Built-in values are `claude` and `codex` (default: `claude`)
 - `agent.args`: Extra CLI args appended to the agent invocation (optional)
 - `agent.timeoutMinutes`: Timeout for a single agent run, in minutes (default: 60)
+- `agent.command` (generic agents): CLI command to execute (defaults to `agent.type`)
+- `agent.promptMode` (generic agents): `stdin` (default) or `arg`
+- `agent.promptArg` (generic agents): prompt flag when `promptMode` is `arg` (default: `-p`)
+- `agent.versionArgs` (generic agents): args used for prerequisite check (default: `["--version"]`)
+- `agent.sessionIdRegex` (generic agents): regex to extract session IDs from output
+- `agent.resume` (generic agents): resume command templates used in PR metadata
+- Parse failures automatically trigger a second call to the same configured agent to normalize output into the expected JSON shape
 
-Example:
+Built-in agent example:
+
 ```json
 {
   "agent": {
     "type": "codex",
     "args": ["--model", "o3"],
     "timeoutMinutes": 60
+  }
+}
+```
+
+Generic agent example:
+```json
+{
+  "agent": {
+    "type": "opencode",
+    "command": "opencode",
+    "args": ["run"],
+    "promptMode": "stdin",
+    "resume": {
+      "withSessionId": "cd {{workspacePath}} && {{command}} resume {{sessionId}}",
+      "withoutSessionId": "cd {{workspacePath}} && {{command}} resume"
+    }
   }
 }
 ```

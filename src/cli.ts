@@ -62,6 +62,7 @@ Configuration (bye-bye-flag-config.json):
   }
 
   Note: Set baseBranch explicitly via repoDefaults.baseBranch or repos.<name>.baseBranch.
+  Note: agent.type supports built-in values ("claude", "codex") and custom CLI adapters.
 
 Examples:
   # Run the orchestrator (fetches stale flags and processes them)

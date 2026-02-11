@@ -33,7 +33,23 @@ Common patterns to look for:
 - `featureFlags.{{flagKeyCamel}}`
 - Environment variables or config files
 
-Note: The flag has been verified to exist in the codebase before you were launched.
+Important: upstream pre-checks are heuristic and may include false positives. Treat string matches as candidates, not proof.
+
+### Step 1.5: Validate that matches are true feature-flag usage
+
+Before editing, confirm the match actually represents this feature flag controlling behavior.
+
+Valid examples:
+- A known feature-flag API call using this key
+- A typed flag map / provider payload where this key is an actual flag identifier
+- Conditional logic where this flag determines enabled vs disabled behavior
+
+Invalid examples (do NOT edit these):
+- Generic string/query/cache keys that happen to contain similar text
+- Renames in unrelated identifiers, labels, comments, or telemetry keys
+- Legacy leftovers not connected to current flag evaluation
+
+If you cannot find at least one valid feature-flag usage to remove, or the flag appears already removed, **refuse** with status `"refused"` and make **zero code changes**.
 
 ### Step 2: Remove the flag
 
@@ -41,6 +57,7 @@ For each usage:
 - Remove the conditional check entirely
 - Keep the `{{keepBranch}}` code path
 - Remove the `{{removeBranch}}` code path
+- Do not rename unrelated strings/identifiers just because they contain the flag text
 
 Example transformation (keeping `enabled` branch):
 ```typescript
@@ -118,6 +135,7 @@ Rules:
 - If tests/lint/typecheck were skipped or not run, set them to `true`.
 - Only include `verificationDetails` entries for checks that failed.
 - If you refuse (e.g. flag not found / too risky), use `"status": "refused"` and explain in `summary`.
+- If all matches are false positives/non-FF contexts, refuse and report that no valid flag usage remained.
 
 ## Important Rules
 
@@ -126,3 +144,4 @@ Rules:
 3. **Be thorough with cleanup** - don't leave dead code behind
 4. **Preserve functionality** - the app should work exactly as if the flag was always `{{keepBranch}}`
 5. **If unsure, refuse** - it's better to refuse than to break the codebase
+6. **No valid FF usage => refuse with no edits** - never force changes from incidental string matches

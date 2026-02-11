@@ -2,7 +2,7 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { execa } from 'execa';
 import { CONFIG } from '../config.ts';
-import { consoleLogger, type AgentKind, type Logger, type RemovalRequest, type RemovalResult, type RepoResult } from '../types.ts';
+import { consoleLogger, type Logger, type RemovalRequest, type RemovalResult, type RepoResult } from '../types.ts';
 import {
   setupMultiRepoWorktrees,
   cleanupMultiRepoWorktrees,
@@ -11,10 +11,8 @@ import {
   type ByeByeFlagConfig,
 } from './scaffold.ts';
 import { generatePrompt, readContextFiles } from './prompt.ts';
-import { invokeClaudeCode } from './invoke.ts';
-import { invokeCodexCli } from './invoke-codex.ts';
 import { commitAndPushMultiRepo, findExistingPR, hasChanges, showDiff } from './git.ts';
-import { getSessionId } from './invoke.ts';
+import { resolveAgentRuntime, type AgentRuntime } from './adapters.ts';
 import type { ConfigContext } from '../config-context.ts';
 
 export interface RemoveFlagOptions extends RemovalRequest {
@@ -97,10 +95,11 @@ async function flagExistsInCodebase(
  */
 async function checkPrerequisites(
   configContext: ConfigContext,
-  dryRun: boolean | undefined
+  dryRun: boolean | undefined,
+  agentRuntime: AgentRuntime
 ): Promise<string[]> {
   const errors: string[] = [];
-  const { reposDir, config } = configContext;
+  const { reposDir } = configContext;
 
   // Check git is installed
   try {
@@ -119,28 +118,25 @@ async function checkPrerequisites(
     errors.push(`Config directory does not exist: ${reposDir}`);
   }
 
-  // Read config to determine which agent CLI is required
-  let agentKind: AgentKind | null = null;
-  if (errors.length === 0) {
+  if (agentRuntime.kind === 'claude') {
     try {
-      agentKind = (config.agent?.type ?? 'claude') as AgentKind;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      errors.push(message);
-    }
-  }
-
-  if (agentKind === 'claude') {
-    try {
-      await execa('claude', ['--version']);
+      await execa(agentRuntime.prerequisiteCommand, agentRuntime.prerequisiteArgs);
     } catch {
       errors.push('claude CLI is not installed. Install with: npm install -g @anthropic-ai/claude-code');
     }
-  } else if (agentKind === 'codex') {
+  } else if (agentRuntime.kind === 'codex') {
     try {
-      await execa('codex', ['--version']);
+      await execa(agentRuntime.prerequisiteCommand, agentRuntime.prerequisiteArgs);
     } catch {
       errors.push('codex CLI is not installed. Install Codex CLI first.');
+    }
+  } else {
+    try {
+      await execa(agentRuntime.prerequisiteCommand, agentRuntime.prerequisiteArgs);
+    } catch {
+      errors.push(
+        `Configured agent CLI "${agentRuntime.prerequisiteCommand}" is not installed or not in PATH.`
+      );
     }
   }
 
@@ -178,12 +174,14 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
     options;
   const { reposDir, configPath, config } = configContext;
   const branchName = `${CONFIG.branchPrefix}${flagKey}`;
-  let agentKind: AgentKind = 'claude';
+  const agentRuntime = resolveAgentRuntime(config);
+  let agentKind = agentRuntime.kind;
   let agentSessionId: string | undefined;
+  let agentResumeCommand = `cd <worktree> && ${agentKind} --resume`;
 
   // Check prerequisites first
   logger.log('Checking prerequisites...');
-  const errors = await checkPrerequisites(configContext, dryRun);
+  const errors = await checkPrerequisites(configContext, dryRun, agentRuntime);
   if (errors.length > 0) {
     logger.error('Prerequisite check failed:');
     errors.forEach((e) => logger.error(`  - ${e}`));
@@ -199,9 +197,8 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
   logger.log(`Repos directory: ${reposDir}`);
   logger.log(`${'='.repeat(60)}`);
 
-  // Fetch latest from all repos before checking for flag
-  // TODO: Revisit - should we always skip these checks? Depends on whether we need standalone agent usage
-  // When called from orchestrator, skipFetch=true and these checks are already done at orchestrator level
+  // Fetch latest from all repos before checking for flag.
+  // When called from orchestrator, skipFetch=true and these checks are already done at orchestrator level.
   if (!options.skipFetch) {
     logger.log('Fetching latest from origin...');
     await fetchAllRepos(configContext);
@@ -274,13 +271,6 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
     logger.log(`Found ${scaffoldResult.repos.length} repos:`);
     scaffoldResult.repos.forEach((r) => logger.log(`  - ${r.name}`));
 
-    agentKind = (config.agent?.type ?? 'claude') as AgentKind;
-    const agentArgs = config.agent?.args ?? [];
-    const agentTimeoutMs =
-      config.agent?.timeoutMinutes !== undefined
-        ? config.agent.timeoutMinutes * 60 * 1000
-        : CONFIG.agentTimeoutMs;
-
     // Read context from workspace (copied from reposDir)
     const globalContext = await readContextFiles(scaffoldResult.workspacePath);
 
@@ -292,40 +282,18 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
 
     logger.log(`Launching agent (${agentKind}) to remove the flag...`);
 
-    let agentOutput: Awaited<ReturnType<typeof invokeClaudeCode>>;
-
-    if (agentKind === 'claude') {
-      // Generate session ID for this run (used for resume capability)
-      agentSessionId = getSessionId(branchName);
-      // Run Claude Code at the workspace root (can see all repos)
-      agentOutput = await invokeClaudeCode(
-        scaffoldResult.workspacePath,
-        branchName,
-        prompt,
-        reposDir,
-        undefined,
-        configPath,
-        agentSessionId,
-        logger,
-        agentArgs,
-        agentTimeoutMs
-      );
-    } else if (agentKind === 'codex') {
-      const codexResult = await invokeCodexCli(
-        scaffoldResult.workspacePath,
-        prompt,
-        reposDir,
-        undefined,
-        configPath,
-        logger,
-        agentArgs,
-        agentTimeoutMs
-      );
-      agentSessionId = codexResult.sessionId;
-      agentOutput = codexResult.output;
-    } else {
-      throw new Error(`Unknown agent type: ${agentKind}`);
-    }
+    const invocation = await agentRuntime.invoke({
+      workspacePath: scaffoldResult.workspacePath,
+      branchName,
+      prompt,
+      reposDir,
+      configPath,
+      logger,
+    });
+    agentKind = invocation.kind;
+    agentSessionId = invocation.sessionId;
+    agentResumeCommand = invocation.resumeCommand;
+    const agentOutput = invocation.output;
 
     if (agentOutput.status === 'refused') {
       logger.log(`Agent refused: ${agentOutput.summary}`);
@@ -373,7 +341,7 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
       agentOutput,
       agentKind,
       agentSessionId,
-      scaffoldResult.workspacePath,
+      agentResumeCommand,
       flagCreatedBy
     );
 

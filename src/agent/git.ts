@@ -57,11 +57,10 @@ export async function commitAndPushMultiRepo(
   agentOutput: AgentOutput,
   agentKind: AgentKind,
   sessionId: string | undefined,
-  workspacePath: string,
+  resumeCommand: string,
   flagCreatedBy?: string
 ): Promise<RepoResult[]> {
   const results: RepoResult[] = [];
-  const prUrls: string[] = [];
 
   // First pass: commit and push repos with changes
   for (const repo of repos) {
@@ -108,12 +107,11 @@ export async function commitAndPushMultiRepo(
         branchName,
         agentKind,
         sessionId,
-        workspacePath,
+        resumeCommand,
         flagCreatedBy,
         successfulRepos.filter((r) => r.repoName !== result.repoName).map((r) => r.repoName)
       );
       result.prUrl = prUrl;
-      prUrls.push(prUrl);
     } catch (error) {
       result.status = 'failed';
       result.error = `PR creation failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -134,6 +132,130 @@ export interface ExistingPR {
   url: string;
   state: 'OPEN' | 'CLOSED' | 'MERGED';
   declined: boolean; // True if PR title contains [DECLINED]
+  history: PRHistoryEntry[];
+}
+
+export interface PRHistoryEntry {
+  url: string;
+  state: 'OPEN' | 'CLOSED' | 'MERGED';
+  declined: boolean;
+  createdAt?: string;
+}
+
+interface PullRequestSummary {
+  url: string;
+  state: 'OPEN' | 'CLOSED' | 'MERGED';
+  title: string;
+  createdAt?: string;
+}
+
+interface GitHubPRListItem extends PullRequestSummary {
+  headRefName: string;
+}
+
+interface FetchPRSafetyStatesOptions {
+  headBranch?: string;
+  limit?: number;
+}
+
+function sortNewestFirst(prs: PullRequestSummary[]): PullRequestSummary[] {
+  return [...prs].sort((a, b) => {
+    const aTs = a.createdAt ? Date.parse(a.createdAt) : 0;
+    const bTs = b.createdAt ? Date.parse(b.createdAt) : 0;
+    return bTs - aTs;
+  });
+}
+
+function resolvePRSafetyState(
+  prs: PullRequestSummary[]
+): ExistingPR | null {
+  if (prs.length === 0) return null;
+  const newestFirst = sortNewestFirst(prs);
+  const history: PRHistoryEntry[] = newestFirst.map((pr) => ({
+    url: pr.url,
+    state: pr.state,
+    declined: (pr.title || '').includes('[DECLINED]'),
+    createdAt: pr.createdAt,
+  }));
+
+  const declined = history.find((pr) => pr.declined);
+  if (declined) {
+    return {
+      url: declined.url,
+      state: declined.state,
+      declined: true,
+      history,
+    };
+  }
+
+  const open = history.find((pr) => pr.state === 'OPEN');
+  if (open) {
+    return {
+      url: open.url,
+      state: open.state,
+      declined: false,
+      history,
+    };
+  }
+
+  // Fall back to newest entry for logging/metadata.
+  const latest = history[0];
+  return {
+    url: latest.url,
+    state: latest.state,
+    declined: false,
+    history,
+  };
+}
+
+function groupFlagBranchPRs(prs: GitHubPRListItem[]): Map<string, PullRequestSummary[]> {
+  const groupedByFlag = new Map<string, PullRequestSummary[]>();
+
+  for (const pr of prs) {
+    if (!pr.headRefName.startsWith(CONFIG.branchPrefix)) continue;
+    const flagKey = pr.headRefName.replace(CONFIG.branchPrefix, '');
+    const existing = groupedByFlag.get(flagKey) ?? [];
+    existing.push({
+      url: pr.url,
+      state: pr.state,
+      title: pr.title,
+      createdAt: pr.createdAt,
+    });
+    groupedByFlag.set(flagKey, existing);
+  }
+
+  return groupedByFlag;
+}
+
+function resolveSafetyStatesByFlag(prs: GitHubPRListItem[]): Map<string, ExistingPR> {
+  const result = new Map<string, ExistingPR>();
+  const groupedByFlag = groupFlagBranchPRs(prs);
+
+  for (const [flagKey, flagPRs] of groupedByFlag) {
+    const safetyState = resolvePRSafetyState(flagPRs);
+    if (safetyState) {
+      result.set(flagKey, safetyState);
+    }
+  }
+
+  return result;
+}
+
+async function fetchPRSafetyStates(
+  repoPath: string,
+  options?: FetchPRSafetyStatesOptions
+): Promise<Map<string, ExistingPR>> {
+  const args = ['pr', 'list', '--state', 'all', '--json', 'url,state,title,headRefName,createdAt'] as string[];
+
+  if (options?.headBranch) {
+    args.push('--head', options.headBranch);
+  }
+
+  args.push('--limit', String(options?.limit ?? 500));
+
+  const { stdout } = await execa('gh', args, { cwd: repoPath });
+  const prs = JSON.parse(stdout) as GitHubPRListItem[];
+  return resolveSafetyStatesByFlag(prs);
 }
 
 /**
@@ -143,22 +265,11 @@ export interface ExistingPR {
 export async function findExistingPR(repoPath: string, flagKey: string): Promise<ExistingPR | null> {
   const branchName = `${CONFIG.branchPrefix}${flagKey}`;
   try {
-    // Search for PRs with this head branch (any state)
-    const { stdout } = await execa(
-      'gh',
-      ['pr', 'list', '--head', branchName, '--state', 'all', '--json', 'url,state,title', '--limit', '1'],
-      { cwd: repoPath }
-    );
-    const prs = JSON.parse(stdout);
-    if (prs.length > 0) {
-      const title: string = prs[0].title || '';
-      return {
-        url: prs[0].url,
-        state: prs[0].state,
-        declined: title.includes('[DECLINED]'),
-      };
-    }
-    return null;
+    const byFlag = await fetchPRSafetyStates(repoPath, {
+      headBranch: branchName,
+      limit: 100,
+    });
+    return byFlag.get(flagKey) ?? null;
   } catch {
     // gh command failed, assume no existing PR
     return null;
@@ -172,49 +283,12 @@ export async function findExistingPR(repoPath: string, flagKey: string): Promise
 export async function fetchAllFlagPRs(
   repoPath: string
 ): Promise<Map<string, ExistingPR>> {
-  const result = new Map<string, ExistingPR>();
-
   try {
-    // Fetch all PRs (any state) - we'll filter by branch prefix
-    // Using search query for branches starting with our branch prefix
-    const { stdout } = await execa(
-      'gh',
-      [
-        'pr',
-        'list',
-        '--state',
-        'all',
-        '--json',
-        'url,state,title,headRefName',
-        '--limit',
-        '500', // Should be enough for most repos
-      ],
-      { cwd: repoPath }
-    );
-
-    const prs = JSON.parse(stdout) as Array<{
-      url: string;
-      state: 'OPEN' | 'CLOSED' | 'MERGED';
-      title: string;
-      headRefName: string;
-    }>;
-
-    for (const pr of prs) {
-      // Only include PRs from our branches
-      if (pr.headRefName.startsWith(CONFIG.branchPrefix)) {
-        const flagKey = pr.headRefName.replace(CONFIG.branchPrefix, '');
-        result.set(flagKey, {
-          url: pr.url,
-          state: pr.state,
-          declined: pr.title.includes('[DECLINED]'),
-        });
-      }
-    }
+    return await fetchPRSafetyStates(repoPath, { limit: 500 });
   } catch {
     // gh command failed, return empty map
+    return new Map<string, ExistingPR>();
   }
-
-  return result;
 }
 
 /**
@@ -228,7 +302,7 @@ export async function createPR(
   branchName: string,
   agentKind: AgentKind,
   sessionId: string | undefined,
-  workspacePath: string,
+  resumeCommand: string,
   flagCreatedBy: string | undefined,
   relatedRepos: string[] = []
 ): Promise<string> {
@@ -239,7 +313,7 @@ export async function createPR(
     branchName,
     agentKind,
     sessionId,
-    workspacePath,
+    resumeCommand,
     flagCreatedBy,
     relatedRepos
   );
@@ -275,7 +349,7 @@ function generatePRBody(
   branchName: string,
   agentKind: AgentKind,
   sessionId: string | undefined,
-  workspacePath: string,
+  resumeCommand: string,
   flagCreatedBy: string | undefined,
   relatedRepos: string[] = []
 ): string {
@@ -361,24 +435,11 @@ ${sessionId ? `- **Session ID:** \`${sessionId}\`` : ''}
 
 **To resume this agent session** (from the same machine):
 \`\`\`bash
-${getResumeCommand(agentKind, sessionId, workspacePath)}
+${resumeCommand}
 \`\`\`
 
 **If this PR is declined:** Add \`[DECLINED]\` to the PR title to prevent future removal attempts for this flag.
 
 </details>
 `;
-}
-
-function getResumeCommand(agentKind: AgentKind, sessionId: string | undefined, workspacePath: string): string {
-  if (agentKind === 'claude') {
-    return sessionId
-      ? `cd ${workspacePath} && claude --resume ${sessionId}`
-      : `cd ${workspacePath} && claude --resume <session-id>`;
-  }
-
-  // Codex CLI
-  return sessionId
-    ? `cd ${workspacePath} && codex resume ${sessionId}`
-    : `cd ${workspacePath} && codex resume --all`;
 }

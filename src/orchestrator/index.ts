@@ -375,10 +375,21 @@ async function filterFlagsWithExistingPRs(
       const prs = await fetchAllFlagPRs(repoPath);
       prsByRepo.set(repoName, prs);
       if (prs.size > 0) {
-        console.log(`    Found ${prs.size} PRs:`);
+        const totalPRs = Array.from(prs.values()).reduce(
+          (sum, pr) => sum + Math.max(pr.history.length, 1),
+          0
+        );
+        console.log(`    Found ${totalPRs} PR(s) across ${prs.size} flag key(s):`);
         for (const [flagKey, pr] of prs) {
           const status = pr.declined ? 'DECLINED' : pr.state;
           console.log(`      • ${flagKey}: ${pr.url} (${status})`);
+          if (pr.history.length > 1) {
+            for (const older of pr.history.slice(1)) {
+              const olderStatus = older.declined ? 'DECLINED' : older.state;
+              const createdAt = older.createdAt ? `, created ${older.createdAt}` : '';
+              console.log(`        - older: ${older.url} (${olderStatus}${createdAt})`);
+            }
+          }
         }
       } else {
         console.log(`    No existing PRs`);
@@ -452,7 +463,7 @@ async function processFlags(
   skippedFlags: FlagResult[]
 ): Promise<{ results: FlagResult[]; remaining: FlagWithCodeReferences[] }> {
   const { configContext } = config;
-  const { reposDir, config: byeByeConfig } = configContext;
+  const { config: byeByeConfig } = configContext;
   const agentKind = byeByeConfig.agent?.type ?? 'claude';
   const worktreeBasePath = byeByeConfig.worktrees?.basePath ?? CONFIG.worktreeBasePath;
 
@@ -1048,5 +1059,3 @@ function formatDuration(ms: number): string {
   const mins = minutes % 60;
   return `${hours}h ${mins}m`;
 }
-
-export { runWithFlags };

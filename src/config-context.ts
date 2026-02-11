@@ -1,11 +1,11 @@
 import * as path from 'path';
-import { readConfig, type ByeByeFlagConfig } from './agent/scaffold.ts';
+import { CONFIG_FILENAME, readConfig, type ByeByeFlagConfig } from './agent/scaffold.ts';
 import type { FetcherConfig } from './fetchers/types.ts';
 
 const DEFAULT_CONCURRENCY = 3;
 const DEFAULT_MAX_PRS = 10;
 const DEFAULT_LOG_DIR = './bye-bye-flag-logs';
-export const DEFAULT_CONFIG_FILENAME = 'bye-bye-flag-config.json';
+export const DEFAULT_CONFIG_FILENAME = CONFIG_FILENAME;
 
 export interface ConfigContext {
   reposDir: string;

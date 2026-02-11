@@ -49,7 +49,8 @@ export interface RemovalResult {
   error?: string;
 }
 
-export type AgentKind = 'claude' | 'codex';
+export type BuiltInAgentKind = 'claude' | 'codex';
+export type AgentKind = BuiltInAgentKind | (string & {});
 
 // Schema for validating the agent's structured output
 export const AgentOutputSchema = z.object({

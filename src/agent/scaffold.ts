@@ -193,7 +193,36 @@ export async function setupMultiRepoWorktrees(
     };
   });
 
-  const repos = await Promise.all(repoSetupPromises);
+  const setupResults = await Promise.allSettled(repoSetupPromises);
+  const repos: ScaffoldResult['repos'] = [];
+  const failures: string[] = [];
+
+  for (let index = 0; index < setupResults.length; index++) {
+    const result = setupResults[index];
+    if (result.status === 'fulfilled') {
+      repos.push(result.value);
+      continue;
+    }
+    const repoName = configuredRepos[index];
+    const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+    failures.push(`${repoName}: ${reason}`);
+  }
+
+  if (failures.length > 0) {
+    // Best-effort rollback so setup failures do not leave partial worktrees behind.
+    for (const repoName of configuredRepos) {
+      const repoPath = path.join(reposDir, repoName);
+      const worktreePath = path.join(workspacePath, repoName);
+      await cleanupWorktree(repoPath, worktreePath);
+    }
+    try {
+      await fs.rm(workspacePath, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup errors while surfacing the original failure.
+    }
+
+    throw new Error(`Failed to setup worktrees:\n${failures.join('\n')}`);
+  }
 
   // Copy any .md files from reposDir to workspace root (for context)
   const dirEntries = await fs.readdir(reposDir, { withFileTypes: true });
@@ -283,38 +312,66 @@ const FetcherConfigSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('manual') }).strict(),
 ]);
 
-const AgentConfigSchema = z.discriminatedUnion('type', [
-  z
-    .object({
-      type: z.literal('claude'),
-      /**
-       * Extra CLI args appended to the invocation (for example: model selection).
-       * Do not include the prompt/session flags; those are managed by bye-bye-flag.
-       */
-      args: z.array(z.string()).optional(),
-      /**
-       * Timeout for a single agent run (in minutes).
-       * If unset, defaults to CONFIG.agentTimeoutMs.
-       */
-      timeoutMinutes: z.number().int().positive().optional(),
-    })
-    .strict(),
-  z
-    .object({
-      type: z.literal('codex'),
-      /**
-       * Extra CLI args appended to the invocation (for example: model/profile selection).
-       * Do not include the prompt/session flags; those are managed by bye-bye-flag.
-       */
-      args: z.array(z.string()).optional(),
-      /**
-       * Timeout for a single agent run (in minutes).
-       * If unset, defaults to CONFIG.agentTimeoutMs.
-       */
-      timeoutMinutes: z.number().int().positive().optional(),
-    })
-    .strict(),
-]);
+const AgentConfigSchema = z
+  .object({
+    /**
+     * Agent identifier.
+     * Built-in preset values include "claude" and "codex".
+     */
+    type: z.string().min(1),
+    /**
+     * CLI command to execute. Defaults to `type` when omitted.
+     * Example: "opencode", "amp", "pi".
+     */
+    command: z.string().min(1).optional(),
+    /**
+     * Extra args passed to the CLI command.
+     */
+    args: z.array(z.string()).optional(),
+    /**
+     * Timeout for a single agent run (in minutes).
+     */
+    timeoutMinutes: z.number().int().positive().optional(),
+    /**
+     * How the prompt is delivered to the agent.
+     * - "stdin": prompt is piped to stdin (default).
+     * - "arg": prompt is passed via `promptArg`.
+     */
+    promptMode: z.enum(['stdin', 'arg']).optional(),
+    /**
+     * Prompt flag used when promptMode="arg" (default "-p").
+     */
+    promptArg: z.string().min(1).optional(),
+    /**
+     * Version args used for prerequisite checks (default ["--version"]).
+     */
+    versionArgs: z.array(z.string()).optional(),
+    /**
+     * Optional regex to extract session ID from agent output.
+     * If the regex has a capture group, group 1 is used.
+     */
+    sessionIdRegex: z.string().min(1).optional(),
+    /**
+     * Optional resume command templates for PR metadata.
+     */
+    resume: z
+      .object({
+        withSessionId: z.string().min(1).optional(),
+        withoutSessionId: z.string().min(1).optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict()
+  .superRefine((cfg, ctx) => {
+    if (cfg.promptMode === 'arg' && (!cfg.promptArg || cfg.promptArg.trim().length === 0)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['promptArg'],
+        message: 'promptArg is required when promptMode is "arg".',
+      });
+    }
+  });
 
 const ByeByeFlagConfigSchema = z
   .object({
@@ -352,6 +409,7 @@ const ByeByeFlagConfigSchema = z
   });
 
 export type ByeByeFlagConfig = z.infer<typeof ByeByeFlagConfigSchema>;
+export type AgentConfig = z.infer<typeof AgentConfigSchema>;
 
 export function getRepoBaseBranch(config: ByeByeFlagConfig, repoName: string): string {
   const repoConfig = config.repos[repoName];
@@ -375,7 +433,7 @@ let cachedConfigPath: string | null = null;
  * Optionally accepts an explicit configPath
  * Throws if config file is missing
  */
-const CONFIG_FILENAME = 'bye-bye-flag-config.json';
+export const CONFIG_FILENAME = 'bye-bye-flag-config.json';
 
 function resolveConfigPath(reposDir: string, configPath?: string): string {
   if (configPath) return path.resolve(configPath);

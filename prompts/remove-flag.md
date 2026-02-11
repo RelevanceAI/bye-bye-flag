@@ -38,6 +38,8 @@ Common patterns to look for:
 - `featureFlags.{{flagKeyCamel}}`
 - Environment variables or config files
 
+**CRITICAL — exact key match only:** You are removing the flag `{{flagKey}}` and ONLY that flag. Do NOT touch flags that merely contain `{{flagKey}}` as a substring (e.g. if the flag is `cmd`, do NOT modify `cmd-k`, `cmd-bar`, `my-cmd`, etc.). Always verify the **full flag key string** matches exactly before editing.
+
 Important: upstream pre-checks are heuristic and may include false positives. Treat string matches as candidates, not proof.
 
 ### Step 1.5: Validate that matches are true feature-flag usage
@@ -52,6 +54,7 @@ Valid examples:
 
 Invalid examples (do NOT edit these):
 
+- A different flag whose key contains `{{flagKey}}` as a substring (e.g. `{{flagKey}}-foo` or `prefix-{{flagKey}}`)
 - Generic string/query/cache keys that happen to contain similar text
 - Renames in unrelated identifiers, labels, comments, or telemetry keys
 - Legacy leftovers not connected to current flag evaluation

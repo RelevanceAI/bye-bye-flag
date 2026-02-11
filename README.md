@@ -40,10 +40,22 @@ cd .target-repos
 git clone git@github.com:your-org/your-repo.git
 ```
 
-3. **Create a minimal config** (`.target-repos/bye-bye-flag-config.json`):
+3. **Create a config file** (`.target-repos/bye-bye-flag-config.json`):
 
 ```json
 {
+  "agent": {
+    "type": "claude",
+    "timeoutMinutes": 60
+  },
+  "fetcher": {
+    "type": "posthog",
+    "projectIds": ["12345"]
+  },
+  "orchestrator": {
+    "concurrency": 2,
+    "maxPrs": 2
+  },
   "repos": {
     "your-repo": {
       "baseBranch": "main",
@@ -53,23 +65,20 @@ git clone git@github.com:your-org/your-repo.git
 }
 ```
 
-4. **Remove a single flag** (to test your setup):
+4. **Add your PostHog API key** (see [Environment Variables](#environment-variables-secrets)):
 
 ```bash
-pnpm start remove --target-repos=./.target-repos --flag=my-flag-key --keep=enabled --dry-run
+cp .env.example .env
+# Edit .env with your POSTHOG_API_KEY
 ```
 
-5. **Run the full orchestrator** (with PostHog or a flags JSON file):
+5. **Run it:**
 
 ```bash
-# With a JSON file of flags to remove
-pnpm start run --target-repos=./.target-repos --input=flags.json
-
-# With PostHog (requires POSTHOG_API_KEY in .env — see Environment Variables)
 pnpm start run --target-repos=./.target-repos
 ```
 
-See [examples/](examples/) for sample config and flags files.
+This will fetch stale flags from PostHog, spin up agents in parallel, and open draft PRs for review. See [examples/](examples/) for more config options.
 
 ## Directory Structure
 

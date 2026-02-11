@@ -4,6 +4,56 @@ Remove stale feature flags from codebases using AI.
 
 `bye-bye-flag` uses a CLI coding agent to automatically find and remove feature flag conditionals, clean up dead code, and create pull requests.
 
+## Quick Start
+
+1. **Clone and install:**
+
+```bash
+git clone https://github.com/RelevanceAI/bye-bye-flag.git
+cd bye-bye-flag
+nvm use
+pnpm install
+```
+
+2. **Set up your target repos directory:**
+
+```bash
+mkdir .target-repos
+cd .target-repos
+git clone git@github.com:your-org/your-repo.git
+```
+
+3. **Create a minimal config** (`.target-repos/bye-bye-flag-config.json`):
+
+```json
+{
+  "repos": {
+    "your-repo": {
+      "baseBranch": "main",
+      "setup": ["pnpm install"]
+    }
+  }
+}
+```
+
+4. **Remove a single flag** (to test your setup):
+
+```bash
+pnpm start remove --target-repos=./.target-repos --flag=my-flag-key --keep=enabled --dry-run
+```
+
+5. **Run the full orchestrator** (with PostHog or a flags JSON file):
+
+```bash
+# With a JSON file of flags to remove
+pnpm start run --target-repos=./.target-repos --input=flags.json
+
+# With PostHog (requires POSTHOG_API_KEY in .env)
+pnpm start run --target-repos=./.target-repos
+```
+
+See [examples/](examples/) for sample config and flags files.
+
 ## Prerequisites
 
 - **Node.js 24+** (native TypeScript support)
@@ -452,6 +502,25 @@ When running with the built-in Claude preset, `bye-bye-flag` passes `--dangerous
 - The tool never pushes to your default branch directly
 
 If you are using a custom agent via `agent.command`, review its permission model to understand what access it has.
+
+## Contributing
+
+Contributions are welcome! Some areas where help would be especially valuable:
+
+- **Agent adapters** — add presets for more coding agents (Aider, Amp, Cursor CLI, etc.)
+- **Flag fetchers** — add integrations for LaunchDarkly, Statsig, Unleash, or other feature flag providers
+- **Cloud/CI execution** — make bye-bye-flag runnable in CI pipelines or cloud environments (GitHub Actions, etc.)
+- **Bug fixes and improvements** — better error messages, edge case handling, documentation
+
+To get started:
+
+```bash
+git clone https://github.com/RelevanceAI/bye-bye-flag.git
+cd bye-bye-flag
+nvm use
+pnpm install
+pnpm test
+```
 
 ## License
 

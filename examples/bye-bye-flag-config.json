@@ -4,6 +4,10 @@
     "projectIds": [12345],
     "staleDays": 30
   },
+  "agent": {
+    "type": "claude",
+    "timeoutMinutes": 60
+  },
   "orchestrator": {
     "concurrency": 3,
     "maxPrs": 10,

@@ -17,9 +17,7 @@ interface PromptParams {
 export async function readContextFiles(dirPath: string): Promise<string> {
   try {
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
-    const mdFiles = entries.filter(
-      (e) => e.isFile() && e.name.endsWith('.md') && !e.name.startsWith('.')
-    );
+    const mdFiles = entries.filter((e) => e.isFile() && e.name.endsWith('.md') && !e.name.startsWith('.'));
 
     if (mdFiles.length === 0) {
       return '';
@@ -48,10 +46,7 @@ export async function generatePrompt(params: PromptParams): Promise<string> {
   const flagKeyCamel = toCamelCase(flagKey);
   const flagKeyScreaming = toScreamingSnake(flagKey);
 
-  const promptTemplate = await fs.readFile(
-    path.join(__dirname, '../../prompts/remove-flag.md'),
-    'utf-8'
-  );
+  const promptTemplate = await fs.readFile(path.join(__dirname, '../../prompts/remove-flag.md'), 'utf-8');
 
   // Build context section
   let contextSection = '';
@@ -66,7 +61,7 @@ export async function generatePrompt(params: PromptParams): Promise<string> {
   }
 
   // Simple template replacement
-  let prompt = promptTemplate
+  const prompt = promptTemplate
     .replace(/\{\{flagKey\}\}/g, flagKey)
     .replace(/\{\{keepBranch\}\}/g, keepBranch)
     .replace(/\{\{removeBranch\}\}/g, removeBranch)
@@ -78,9 +73,9 @@ export async function generatePrompt(params: PromptParams): Promise<string> {
 }
 
 function toCamelCase(str: string): string {
-  return str.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
+  return str.replace(/[-_.]+([a-z])/g, (_, letter) => letter.toUpperCase());
 }
 
 function toScreamingSnake(str: string): string {
-  return str.replace(/-/g, '_').toUpperCase();
+  return str.replace(/[-_.]+/g, '_').toUpperCase();
 }

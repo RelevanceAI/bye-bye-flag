@@ -69,21 +69,21 @@ bye-bye-flag remove --target-repos=/path/to/target-repos --flag=enable-dashboard
 
 ### `run` command (main command)
 
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--target-repos=<path>` | (required) | Path to target repos root |
-| `--input=<file>` | (fetcher) | Use a JSON file instead of fetcher |
-| `--dry-run` | false | Run agents in dry-run mode (no PRs) |
+| Option                  | Default    | Description                         |
+| ----------------------- | ---------- | ----------------------------------- |
+| `--target-repos=<path>` | (required) | Path to target repos root           |
+| `--input=<file>`        | (fetcher)  | Use a JSON file instead of fetcher  |
+| `--dry-run`             | false      | Run agents in dry-run mode (no PRs) |
 
 ### `remove` command (single flag)
 
-| Option | Description |
-|--------|-------------|
-| `--flag=<key>` | The feature flag key to remove (required) |
-| `--keep=<branch>` | Which code path to keep: `enabled` or `disabled` (required) |
-| `--target-repos=<path>` | Path to target repos root (required) |
-| `--dry-run` | Preview changes without creating a PR |
-| `--keep-worktree` | Keep the worktree after completion for manual inspection |
+| Option                  | Description                                                 |
+| ----------------------- | ----------------------------------------------------------- |
+| `--flag=<key>`          | The feature flag key to remove (required)                   |
+| `--keep=<branch>`       | Which code path to keep: `enabled` or `disabled` (required) |
+| `--target-repos=<path>` | Path to target repos root (required)                        |
+| `--dry-run`             | Preview changes without creating a PR                       |
+| `--keep-worktree`       | Keep the worktree after completion for manual inspection    |
 
 ### `test-setup` command (debug setup issues)
 
@@ -204,6 +204,7 @@ Built-in agent example:
 ```
 
 Generic agent example:
+
 ```json
 {
   "agent": {
@@ -315,6 +316,7 @@ POSTHOG_API_KEY=phx_xxx
 The PostHog fetcher finds flags that are candidates for removal.
 
 **Criteria for stale flags:**
+
 - Updated more than 30 days ago (configurable)
 - Either 0% or 100% rollout (no partial rollouts or complex targeting)
 - No payload
@@ -335,6 +337,7 @@ pnpm run fetch:posthog -- --target-repos=/path/to/target-repos --show-all
 ```
 
 Output is JSON to stdout:
+
 ```json
 [
   {
@@ -434,6 +437,21 @@ Logs: ./bye-bye-flag-logs/2024-01-15T10-30-00
 
 To continue processing remaining flags, run the command again.
 ```
+
+## Security Considerations
+
+When running with the built-in Claude preset, `bye-bye-flag` passes `--dangerously-skip-permissions` to give the agent unrestricted access within the worktree. This is necessary for non-interactive automated operation, but it means:
+
+- The agent can read, write, and delete any files within the worktree
+- The agent can execute arbitrary shell commands (typecheck, lint, tests, etc.)
+
+**Mitigations built in:**
+
+- All work happens in **isolated git worktrees**, not your main repository checkout
+- Changes are submitted as **draft PRs** for human review before merging
+- The tool never pushes to your default branch directly
+
+If you are using a custom agent via `agent.command`, review its permission model to understand what access it has.
 
 ## License
 

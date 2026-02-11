@@ -2,18 +2,19 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { execa } from 'execa';
 import { CONFIG } from '../config.ts';
-import { consoleLogger, type Logger, type RemovalRequest, type RemovalResult, type RepoResult } from '../types.ts';
 import {
-  setupMultiRepoWorktrees,
-  cleanupMultiRepoWorktrees,
-  getRepoBaseBranch,
-  type ScaffoldResult,
-  type ByeByeFlagConfig,
-} from './scaffold.ts';
+  consoleLogger,
+  type Logger,
+  type RemovalRequest,
+  type RemovalResult,
+  type RepoResult,
+} from '../types.ts';
+import { setupMultiRepoWorktrees, cleanupMultiRepoWorktrees, type ScaffoldResult } from './scaffold.ts';
 import { generatePrompt, readContextFiles } from './prompt.ts';
-import { commitAndPushMultiRepo, findExistingPR, hasChanges, showDiff } from './git.ts';
+import { commitAndPushMultiRepo, findExistingPR, hasChanges, stageAndDiff } from './git.ts';
 import { resolveAgentRuntime, type AgentRuntime } from './adapters.ts';
 import type { ConfigContext } from '../config-context.ts';
+import { flagExistsInCodebase, fetchAllRepos } from '../git-utils.ts';
 
 export interface RemoveFlagOptions extends RemovalRequest {
   configContext: ConfigContext;
@@ -21,73 +22,6 @@ export interface RemoveFlagOptions extends RemovalRequest {
   logger?: Logger; // Optional logger (defaults to console)
   // Internal: used by orchestrator to skip redundant preflight checks.
   skipFetch?: boolean;
-}
-
-/**
- * Fetch latest from origin for all configured repos
- */
-async function fetchAllRepos(configContext: ConfigContext): Promise<void> {
-  const { reposDir, config } = configContext;
-  const repoNames = Object.keys(config.repos);
-
-  for (const repoName of repoNames) {
-    const repoPath = path.join(reposDir, repoName);
-    console.log(`  Fetching ${repoName}...`);
-    try {
-      await execa('git', ['fetch', 'origin'], { cwd: repoPath, stdio: 'inherit' });
-    } catch (error) {
-      console.warn(`  Warning: Failed to fetch ${repoName}`);
-    }
-  }
-}
-
-/**
- * Check if a flag exists in a single git repo using git grep on the configured base branch
- */
-async function flagExistsInRepo(repoPath: string, pattern: string, baseBranch: string): Promise<boolean> {
-  // Search on origin/baseBranch to check the latest remote code
-  const result = await execa('git', ['grep', '-lE', pattern, `origin/${baseBranch}`], {
-    cwd: repoPath,
-    reject: false,
-  });
-  return result.exitCode === 0 && result.stdout.trim().length > 0;
-}
-
-/**
- * Check if a flag exists in the codebase using git grep (respects .gitignore)
- * Searches each repo subdirectory in the workspace
- */
-async function flagExistsInCodebase(
-  workspacePath: string,
-  flagKey: string,
-  config: ByeByeFlagConfig
-): Promise<boolean> {
-  try {
-    // Escape regex special characters in the flag key
-    const escapedKey = flagKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    // Search for flag key in quotes (single, double, or backtick) to avoid false positives like my-flag-2
-    const pattern = `["'\`]${escapedKey}["'\`]`;
-
-    // Search each subdirectory that's a git repo
-    const entries = await fs.readdir(workspacePath, { withFileTypes: true });
-    for (const entry of entries) {
-      if (!entry.isDirectory() || entry.name.startsWith('.')) continue;
-        const repoPath = path.join(workspacePath, entry.name);
-        try {
-          await fs.access(path.join(repoPath, '.git'));
-          const baseBranch = getRepoBaseBranch(config, entry.name);
-          if (await flagExistsInRepo(repoPath, pattern, baseBranch)) {
-            return true;
-          }
-        } catch {
-        // Not a git repo, skip
-      }
-    }
-    return false;
-  } catch {
-    // If something fails, assume the flag might exist and let the model check
-    return true;
-  }
 }
 
 /**
@@ -170,14 +104,13 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
     configContext,
     flagCreatedBy,
     logger = consoleLogger,
-  } =
-    options;
+  } = options;
   const { reposDir, configPath, config } = configContext;
   const branchName = `${CONFIG.branchPrefix}${flagKey}`;
   const agentRuntime = resolveAgentRuntime(config);
-  let agentKind = agentRuntime.kind;
+  let resolvedAgentKind = agentRuntime.kind;
   let agentSessionId: string | undefined;
-  let agentResumeCommand = `cd <worktree> && ${agentKind} --resume`;
+  let agentResumeCommand: string | undefined;
 
   // Check prerequisites first
   logger.log('Checking prerequisites...');
@@ -201,7 +134,7 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
   // When called from orchestrator, skipFetch=true and these checks are already done at orchestrator level.
   if (!options.skipFetch) {
     logger.log('Fetching latest from origin...');
-    await fetchAllRepos(configContext);
+    await fetchAllRepos(configContext, logger);
 
     // In standalone mode (remove command), protect against overwriting an existing open/declined PR.
     // The orchestrator performs this check in batch before invoking the agent.
@@ -280,7 +213,7 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
       globalContext,
     });
 
-    logger.log(`Launching agent (${agentKind}) to remove the flag...`);
+    logger.log(`Launching agent (${resolvedAgentKind}) to remove the flag...`);
 
     const invocation = await agentRuntime.invoke({
       workspacePath: scaffoldResult.workspacePath,
@@ -290,7 +223,7 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
       configPath,
       logger,
     });
-    agentKind = invocation.kind;
+    resolvedAgentKind = invocation.kind;
     agentSessionId = invocation.sessionId;
     agentResumeCommand = invocation.resumeCommand;
     const agentOutput = invocation.output;
@@ -316,7 +249,7 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
         const changed = await hasChanges(repo.worktreePath);
         logger.log(`  ${repo.name}: ${changed ? 'HAS CHANGES' : 'no changes'}`);
         if (changed) {
-          const diff = await showDiff(repo.worktreePath);
+          const diff = await stageAndDiff(repo.worktreePath);
           logger.log(`--- ${repo.name} DIFF ---`);
           logger.log(diff);
           logger.log(`--- END ${repo.name} DIFF ---`);
@@ -339,10 +272,11 @@ export async function removeFlag(options: RemoveFlagOptions): Promise<RemovalRes
       flagKey,
       keepBranch,
       agentOutput,
-      agentKind,
+      resolvedAgentKind,
       agentSessionId,
       agentResumeCommand,
-      flagCreatedBy
+      flagCreatedBy,
+      logger
     );
 
     const successCount = repoResults.filter((r) => r.status === 'success').length;

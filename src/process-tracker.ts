@@ -26,13 +26,14 @@ export function killAllChildren(): void {
  * Call this once at startup
  */
 export function setupSignalHandlers(): void {
-  const cleanup = (signal: string) => {
+  const cleanup = (signal: NodeJS.Signals) => {
+    const exitCodes: Record<string, number> = { SIGINT: 130, SIGTERM: 143 };
     console.log(`\n\nReceived ${signal}, shutting down...`);
     killAllChildren();
 
     // Give children a moment to exit, then force exit
     setTimeout(() => {
-      process.exit(130); // 128 + SIGINT(2)
+      process.exit(exitCodes[signal] ?? 128);
     }, 1000);
   };
 

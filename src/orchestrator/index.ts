@@ -7,15 +7,18 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { execa } from 'execa';
+import { z } from 'zod';
 import { fetchFlags, type FlagToRemove, type FetcherConfig } from '../fetchers/index.ts';
 import { removeFlag } from '../agent/index.ts';
 import { fetchAllFlagPRs, type ExistingPR } from '../agent/git.ts';
 import { getRepoBaseBranch, readWorkspaceMetadata } from '../agent/scaffold.ts';
 import { createRunLogger, type FlagLogger, type LogStatus } from './logger.ts';
 import type { RemovalResult } from '../types.ts';
+import { consoleLogger, type Logger } from '../types.ts';
 import { CONFIG } from '../config.ts';
 import type { ConfigContext, RuntimeSettings } from '../config-context.ts';
 import { getRuntimeSettings } from '../config-context.ts';
+import { flagExistsInRepo, fetchAllRepos } from '../git-utils.ts';
 
 export interface OrchestratorConfig {
   configContext: ConfigContext;
@@ -63,38 +66,18 @@ export interface RunSummary {
 type FlagWithCodeReferences = FlagToRemove & { reposWithCode: string[] };
 
 /**
- * Check if a flag exists in a single git repo using git grep on the configured base branch
- */
-async function flagExistsInRepo(
-  repoPath: string,
-  flagKey: string,
-  defaultBranch: string
-): Promise<boolean> {
-  // Escape regex special characters in the flag key
-  const escapedKey = flagKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  // Search for flag key in quotes (single, double, or backtick) to avoid false positives
-  const pattern = `["'\`]${escapedKey}["'\`]`;
-
-  // Search on origin/baseBranch to check the latest remote code
-  const result = await execa('git', ['grep', '-lE', pattern, `origin/${defaultBranch}`], {
-    cwd: repoPath,
-    reject: false,
-  });
-  return result.exitCode === 0 && result.stdout.trim().length > 0;
-}
-
-/**
  * Check which flags exist in the codebase (batch check)
  * Returns set of flag keys that have code references
  */
 async function filterFlagsWithCodeReferences(
   flags: FlagToRemove[],
-  configContext: ConfigContext
+  configContext: ConfigContext,
+  logger: Logger
 ): Promise<{ flagsWithCode: FlagWithCodeReferences[]; flagsWithoutCode: FlagResult[] }> {
   const { reposDir, config } = configContext;
   const repoNames = Object.keys(config.repos);
 
-  console.log('Checking for code references...');
+  logger.log('Checking for code references...');
 
   const flagsWithCode: FlagWithCodeReferences[] = [];
   const flagsWithoutCode: FlagResult[] = [];
@@ -136,7 +119,7 @@ async function filterFlagsWithCodeReferences(
       if (reposWithCode.length > 0) {
         flagsWithCode.push({ ...flag, reposWithCode });
       } else {
-        console.log(`  ○ ${flag.key}: No code references`);
+        logger.log(`  ○ ${flag.key}: No code references`);
         flagsWithoutCode.push({
           key: flag.key,
           status: 'complete',
@@ -151,39 +134,18 @@ async function filterFlagsWithCodeReferences(
 }
 
 /**
- * Fetch latest from origin for all configured repos
- */
-async function fetchAllRepos(configContext: ConfigContext): Promise<void> {
-  const { reposDir, config } = configContext;
-  const repoNames = Object.keys(config.repos);
-
-  console.log('Fetching latest from origin...');
-  await Promise.all(
-    repoNames.map(async (repoName) => {
-      const repoPath = path.join(reposDir, repoName);
-      console.log(`  Fetching ${repoName}...`);
-      try {
-        await execa('git', ['fetch', 'origin'], { cwd: repoPath });
-      } catch (error) {
-        console.warn(`  Warning: Failed to fetch ${repoName}`);
-      }
-    })
-  );
-}
-
-/**
  * Run mainSetup commands on the main repos (not worktrees)
  * This runs once per orchestrator run, so worktrees can copy/link node_modules
  */
-async function runMainSetup(configContext: ConfigContext): Promise<void> {
+async function runMainSetup(configContext: ConfigContext, logger: Logger): Promise<void> {
   const { reposDir, config } = configContext;
   const repoNames = Object.keys(config.repos);
 
   let hasMainSetup = false;
   for (const repoName of repoNames) {
-    const repoConfig = config.repos[repoName];
+    const repoEntry = config.repos[repoName];
     const mainSetup =
-      repoConfig.mainSetup !== undefined ? repoConfig.mainSetup : config.repoDefaults?.mainSetup;
+      repoEntry.mainSetup !== undefined ? repoEntry.mainSetup : config.repoDefaults?.mainSetup;
     if (mainSetup && mainSetup.length > 0) {
       hasMainSetup = true;
       break;
@@ -192,26 +154,26 @@ async function runMainSetup(configContext: ConfigContext): Promise<void> {
 
   if (!hasMainSetup) return;
 
-  console.log('\nRunning main setup on repos...');
+  logger.log('\nRunning main setup on repos...');
   for (const repoName of repoNames) {
-    const repoConfig = config.repos[repoName];
+    const repoEntry = config.repos[repoName];
     const mainSetup =
-      repoConfig.mainSetup !== undefined ? repoConfig.mainSetup : config.repoDefaults?.mainSetup;
+      repoEntry.mainSetup !== undefined ? repoEntry.mainSetup : config.repoDefaults?.mainSetup;
     if (!mainSetup || mainSetup.length === 0) continue;
 
     const repoPath = path.join(reposDir, repoName);
-    const shellInitCmd = repoConfig.shellInit ?? config.repoDefaults?.shellInit;
+    const shellInitCmd = repoEntry.shellInit ?? config.repoDefaults?.shellInit;
     const shellInit = shellInitCmd ? `${shellInitCmd} && ` : '';
 
-    console.log(`  ${repoName}:`);
+    logger.log(`  ${repoName}:`);
     for (const cmd of mainSetup) {
-      console.log(`    Running: ${cmd}`);
+      logger.log(`    Running: ${cmd}`);
       try {
         await execa('bash', ['-c', `${shellInit}${cmd}`], {
           cwd: repoPath,
           stdio: 'inherit',
         });
-      } catch (error) {
+      } catch {
         throw new Error(`Main setup failed for ${repoName}: ${cmd}`);
       }
     }
@@ -226,7 +188,8 @@ async function cleanupStaleWorktrees(
   worktreeBasePath: string,
   reposDir: string,
   repoNames: string[],
-  prsByRepo: Map<string, Map<string, ExistingPR>>
+  prsByRepo: Map<string, Map<string, ExistingPR>>,
+  logger: Logger
 ): Promise<void> {
   const normalizePath = async (value: string): Promise<string> => {
     try {
@@ -254,13 +217,11 @@ async function cleanupStaleWorktrees(
 
   try {
     const entries = await fs.readdir(worktreeBasePath, { withFileTypes: true });
-    const worktreeDirs = entries.filter(
-      (e) => e.isDirectory() && e.name.startsWith('remove-flag-')
-    );
+    const worktreeDirs = entries.filter((e) => e.isDirectory() && e.name.startsWith('remove-flag-'));
 
     if (worktreeDirs.length === 0) return;
 
-    console.log(`\nChecking ${worktreeDirs.length} existing worktree(s) for cleanup...`);
+    logger.log(`\nChecking ${worktreeDirs.length} existing worktree(s) for cleanup...`);
     const normalizedReposDir = await normalizePath(reposDir);
     const registeredByRepo = new Map<string, Set<string>>();
     await Promise.all(
@@ -287,17 +248,15 @@ async function cleanupStaleWorktrees(
       }
 
       if (!hasOpenPR) {
-        console.log(`  Cleaning up worktree for "${flagKey}" (PR merged/closed or not found)`);
+        logger.log(`  Cleaning up worktree for "${flagKey}" (PR merged/closed or not found)`);
         try {
           const metadata = await readWorkspaceMetadata(workspacePath);
           const metadataReposDir =
-            metadata && typeof metadata.reposDir === 'string'
-              ? await normalizePath(metadata.reposDir)
-              : null;
+            metadata && typeof metadata.reposDir === 'string' ? await normalizePath(metadata.reposDir) : null;
           const workspaceOwnedByCurrentRun = metadataReposDir === normalizedReposDir;
 
           if (metadata && !workspaceOwnedByCurrentRun) {
-            console.log(`  Skipping "${flagKey}" (workspace belongs to another repos root)`);
+            logger.log(`  Skipping "${flagKey}" (workspace belongs to another repos root)`);
             continue;
           }
 
@@ -313,7 +272,7 @@ async function cleanupStaleWorktrees(
           if (!workspaceOwnedByCurrentRun && registeredForCurrentRepos.length === 0) {
             // Legacy workspace (no metadata) or foreign directory that is not registered
             // in the current clone's worktree list. Never delete this folder.
-            console.log(`  Skipping "${flagKey}" (not registered to current repos clone)`);
+            logger.log(`  Skipping "${flagKey}" (not registered to current repos clone)`);
             continue;
           }
 
@@ -327,7 +286,7 @@ async function cleanupStaleWorktrees(
             });
             if (removeResult.exitCode !== 0) {
               removalFailed = true;
-              console.warn(
+              logger.error(
                 `  Warning: Failed to remove worktree "${worktreePath}" from ${repoName}; leaving workspace untouched`
               );
             }
@@ -345,7 +304,7 @@ async function cleanupStaleWorktrees(
           // Ignore cleanup errors
         }
       } else {
-        console.log(`  Keeping worktree for "${flagKey}" (PR still open)`);
+        logger.log(`  Keeping worktree for "${flagKey}" (PR still open)`);
       }
     }
   } catch {
@@ -360,18 +319,19 @@ async function cleanupStaleWorktrees(
 async function filterFlagsWithExistingPRs(
   flags: FlagToRemove[],
   configContext: ConfigContext,
-  dryRun: boolean
+  dryRun: boolean,
+  logger: Logger
 ): Promise<{ flagsToProcess: FlagToRemove[]; skippedFlags: FlagResult[] }> {
-  const { reposDir, config: repoConfig } = configContext;
-  const repoNames = Object.keys(repoConfig.repos);
-  const worktreeBasePath = repoConfig.worktrees?.basePath ?? CONFIG.worktreeBasePath;
+  const { reposDir, config } = configContext;
+  const repoNames = Object.keys(config.repos);
+  const worktreeBasePath = config.worktrees?.basePath ?? CONFIG.worktreeBasePath;
 
   // Fetch all flag PRs from all repos in parallel (much faster than per-flag queries)
   const prsByRepo = new Map<string, Map<string, ExistingPR>>();
   await Promise.all(
     repoNames.map(async (repoName) => {
       const repoPath = path.join(reposDir, repoName);
-      console.log(`  Fetching PRs from ${repoName}...`);
+      logger.log(`  Fetching PRs from ${repoName}...`);
       const prs = await fetchAllFlagPRs(repoPath);
       prsByRepo.set(repoName, prs);
       if (prs.size > 0) {
@@ -379,27 +339,27 @@ async function filterFlagsWithExistingPRs(
           (sum, pr) => sum + Math.max(pr.history.length, 1),
           0
         );
-        console.log(`    Found ${totalPRs} PR(s) across ${prs.size} flag key(s):`);
+        logger.log(`    Found ${totalPRs} PR(s) across ${prs.size} flag key(s):`);
         for (const [flagKey, pr] of prs) {
           const status = pr.declined ? 'DECLINED' : pr.state;
-          console.log(`      • ${flagKey}: ${pr.url} (${status})`);
+          logger.log(`      • ${flagKey}: ${pr.url} (${status})`);
           if (pr.history.length > 1) {
             for (const older of pr.history.slice(1)) {
               const olderStatus = older.declined ? 'DECLINED' : older.state;
               const createdAt = older.createdAt ? `, created ${older.createdAt}` : '';
-              console.log(`        - older: ${older.url} (${olderStatus}${createdAt})`);
+              logger.log(`        - older: ${older.url} (${olderStatus}${createdAt})`);
             }
           }
         }
       } else {
-        console.log(`    No existing PRs`);
+        logger.log(`    No existing PRs`);
       }
     })
   );
 
   // Clean up stale worktrees using the PR data we just fetched
   if (!dryRun) {
-    await cleanupStaleWorktrees(worktreeBasePath, reposDir, repoNames, prsByRepo);
+    await cleanupStaleWorktrees(worktreeBasePath, reposDir, repoNames, prsByRepo, logger);
   }
 
   const flagsToProcess: FlagToRemove[] = [];
@@ -421,14 +381,14 @@ async function filterFlagsWithExistingPRs(
     const declinedPRs = existingPRs.filter(({ pr }) => pr.declined);
 
     if (declinedPRs.length > 0) {
-      console.log(`  ⊘ ${flag.key}: Declined (skipping)`);
+      logger.log(`  ⊘ ${flag.key}: Declined (skipping)`);
       skippedFlags.push({
         key: flag.key,
         status: 'skipped',
         skippedReason: `Declined: ${declinedPRs.map((p) => p.pr.url).join(', ')}`,
       });
     } else if (openPRs.length > 0) {
-      console.log(`  ⊘ ${flag.key}: Open PR exists (skipping)`);
+      logger.log(`  ⊘ ${flag.key}: Open PR exists (skipping)`);
       skippedFlags.push({
         key: flag.key,
         status: 'skipped',
@@ -460,7 +420,8 @@ async function processFlags(
     maxPrs: number;
   },
   runLogger: { createFlagLogger: (key: string) => Promise<FlagLogger> },
-  skippedFlags: FlagResult[]
+  skippedFlags: FlagResult[],
+  logger: Logger
 ): Promise<{ results: FlagResult[]; remaining: FlagWithCodeReferences[] }> {
   const { configContext } = config;
   const { config: byeByeConfig } = configContext;
@@ -474,7 +435,7 @@ async function processFlags(
   const MAX_CONSECUTIVE_FAILURES = 3;
   let shouldStop = false;
 
-  console.log(`Processing up to ${config.maxPrs} PRs with concurrency ${config.concurrency}...\n`);
+  logger.log(`Processing up to ${config.maxPrs} PRs with concurrency ${config.concurrency}...\n`);
 
   if (config.maxPrs <= 0) {
     return { results, remaining: queue };
@@ -483,20 +444,20 @@ async function processFlags(
   // Process a single flag, returns the number of PRs created
   const processOneFlag = async (flag: FlagToRemove): Promise<number> => {
     const flagStartTime = Date.now();
-    let logger: FlagLogger | null = null;
+    let flagLogger: FlagLogger | null = null;
 
     try {
-      logger = await runLogger.createFlagLogger(flag.key);
+      flagLogger = await runLogger.createFlagLogger(flag.key);
       const worktreePath = path.join(worktreeBasePath, `remove-flag-${flag.key}`);
-      console.log(
+      logger.log(
         `▶ Starting (${agentKind}): ${flag.key} (${config.maxPrs - remainingPrBudget}/${config.maxPrs} PRs reserved)`
       );
-      console.log(`    Keep: ${flag.keepBranch} | Worktree: ${worktreePath}`);
-      console.log(`    Log: ${logger.path}`);
-      logger.log(`Starting removal of flag: ${flag.key}`);
-      logger.log(`Agent: ${agentKind}`);
-      logger.log(`Keep branch: ${flag.keepBranch}`);
-      if (flag.reason) logger.log(`Reason: ${flag.reason}`);
+      logger.log(`    Keep: ${flag.keepBranch} | Worktree: ${worktreePath}`);
+      logger.log(`    Log: ${flagLogger.path}`);
+      flagLogger.log(`Starting removal of flag: ${flag.key}`);
+      flagLogger.log(`Agent: ${agentKind}`);
+      flagLogger.log(`Keep branch: ${flag.keepBranch}`);
+      if (flag.reason) flagLogger.log(`Reason: ${flag.reason}`);
 
       const result = await removeFlag({
         flagKey: flag.key,
@@ -505,7 +466,7 @@ async function processFlags(
         flagCreatedBy: flag.createdBy,
         dryRun: config.dryRun,
         skipFetch: true,
-        logger: createLoggerFromFlagLogger(logger),
+        logger: createLoggerFromFlagLogger(flagLogger),
       });
 
       const durationMs = Date.now() - flagStartTime;
@@ -514,21 +475,28 @@ async function processFlags(
         consecutiveFailures = 0;
         const prUrls = result.repoResults?.filter((r) => r.prUrl).map((r) => r.prUrl!) || [];
         if (config.dryRun) {
-          console.log(`○ Complete: ${flag.key} (dry-run, ${formatDuration(durationMs)})`);
-          await logger.finish('complete', 'Dry-run complete');
+          logger.log(`○ Complete: ${flag.key} (dry-run, ${formatDuration(durationMs)})`);
+          await flagLogger.finish('complete', 'Dry-run complete');
         } else if (prUrls.length > 0) {
-          console.log(`✓ Complete: ${flag.key} (${prUrls.length} PR(s), ${formatDuration(durationMs)})`);
-          await logger.finish('complete', `${prUrls.length} PR(s) created`);
+          logger.log(`✓ Complete: ${flag.key} (${prUrls.length} PR(s), ${formatDuration(durationMs)})`);
+          await flagLogger.finish('complete', `${prUrls.length} PR(s) created`);
         } else {
-          console.log(`○ Complete: ${flag.key} (no changes needed, ${formatDuration(durationMs)})`);
-          await logger.finish('complete', 'No changes needed');
+          logger.log(`○ Complete: ${flag.key} (no changes needed, ${formatDuration(durationMs)})`);
+          await flagLogger.finish('complete', 'No changes needed');
         }
-        results.push({ key: flag.key, status: 'complete', result, prUrls, durationMs, createdBy: flag.createdBy });
+        results.push({
+          key: flag.key,
+          status: 'complete',
+          result,
+          prUrls,
+          durationMs,
+          createdBy: flag.createdBy,
+        });
         return prUrls.length;
       } else if (result.status === 'refused') {
         consecutiveFailures = 0;
-        console.log(`⊘ Skipped: ${flag.key} (${result.refusalReason})`);
-        await logger.finish('skipped', result.refusalReason);
+        logger.log(`⊘ Skipped: ${flag.key} (${result.refusalReason})`);
+        await flagLogger.finish('skipped', result.refusalReason);
         results.push({
           key: flag.key,
           status: 'skipped',
@@ -540,11 +508,20 @@ async function processFlags(
         return 0;
       } else {
         consecutiveFailures++;
-        console.log(`✗ Failed: ${flag.key} (${result.error})`);
-        await logger.finish('failed', result.error);
-        results.push({ key: flag.key, status: 'failed', result, error: result.error, durationMs, createdBy: flag.createdBy });
+        logger.log(`✗ Failed: ${flag.key} (${result.error})`);
+        await flagLogger.finish('failed', result.error);
+        results.push({
+          key: flag.key,
+          status: 'failed',
+          result,
+          error: result.error,
+          durationMs,
+          createdBy: flag.createdBy,
+        });
         if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-          console.log(`\n⚠ Stopping: ${MAX_CONSECUTIVE_FAILURES} consecutive failures (likely systemic issue)`);
+          logger.log(
+            `\n⚠ Stopping: ${MAX_CONSECUTIVE_FAILURES} consecutive failures (likely systemic issue)`
+          );
           shouldStop = true;
         }
         return 0;
@@ -553,14 +530,20 @@ async function processFlags(
       consecutiveFailures++;
       const durationMs = Date.now() - flagStartTime;
       const errorMsg = error instanceof Error ? error.message : String(error);
-      console.log(`✗ Failed: ${flag.key} (${errorMsg})`);
-      if (logger) {
-        logger.error(errorMsg);
-        await logger.finish('failed', errorMsg);
+      logger.log(`✗ Failed: ${flag.key} (${errorMsg})`);
+      if (flagLogger) {
+        flagLogger.error(errorMsg);
+        await flagLogger.finish('failed', errorMsg);
       }
-      results.push({ key: flag.key, status: 'failed', error: errorMsg, durationMs, createdBy: flag.createdBy });
+      results.push({
+        key: flag.key,
+        status: 'failed',
+        error: errorMsg,
+        durationMs,
+        createdBy: flag.createdBy,
+      });
       if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-        console.log(`\n⚠ Stopping: ${MAX_CONSECUTIVE_FAILURES} consecutive failures (likely systemic issue)`);
+        logger.log(`\n⚠ Stopping: ${MAX_CONSECUTIVE_FAILURES} consecutive failures (likely systemic issue)`);
         shouldStop = true;
       }
       return 0;
@@ -593,7 +576,6 @@ async function processFlags(
         const unused = reserved - prsFromFlag;
         if (unused > 0) remainingPrBudget += unused;
       }
-
     })().finally(() => {
       inFlight.delete(task);
     });
@@ -616,10 +598,11 @@ async function processFlags(
   await Promise.all(inFlight);
 
   if (queue.length > 0 && !shouldStop) {
-    const reason = remainingPrBudget <= 0 ? `Reached ${config.maxPrs} PRs limit` : 'No remaining budget to fit next flag';
-    console.log(`\n${reason}. ${queue.length} flag(s) remaining for next run.`);
+    const reason =
+      remainingPrBudget <= 0 ? `Reached ${config.maxPrs} PRs limit` : 'No remaining budget to fit next flag';
+    logger.log(`\n${reason}. ${queue.length} flag(s) remaining for next run.`);
   } else if (queue.length > 0 && shouldStop) {
-    console.log(`\n${queue.length} flag(s) not attempted due to consecutive failures.`);
+    logger.log(`\n${queue.length} flag(s) not attempted due to consecutive failures.`);
   }
 
   return { results, remaining: queue };
@@ -636,136 +619,34 @@ function createLoggerFromFlagLogger(flagLogger: FlagLogger) {
 }
 
 /**
- * Run the orchestrator
+ * Zod schema for validating --input flag files
+ */
+const FlagToRemoveSchema = z.array(
+  z.object({
+    key: z.string().min(1),
+    keepBranch: z.enum(['enabled', 'disabled']),
+    reason: z.string().optional(),
+    lastModified: z.string().optional(),
+    createdBy: z.string().optional(),
+    metadata: z.record(z.unknown()).optional(),
+  })
+);
+
+/**
+ * Run the orchestrator with flags from a fetcher
  */
 export async function run(config: OrchestratorConfig): Promise<RunSummary> {
-  const startTime = new Date();
-  const { configContext } = config;
-  const { reposDir } = configContext;
-  const runtime = getRuntimeSettings(configContext.config);
-  const { concurrency, maxPrs, logDir } = runtime;
-  const dryRun = config.dryRun ?? false;
-
-  console.log(`\n${'═'.repeat(60)}`);
-  console.log('                    bye-bye-flag Orchestrator');
-  console.log(`${'═'.repeat(60)}`);
-  console.log(`Repos directory: ${reposDir}`);
-  console.log(`Concurrency: ${concurrency}`);
-  console.log(`Max PRs: ${maxPrs}`);
-  console.log(`Dry run: ${dryRun}`);
-  console.log(`${'═'.repeat(60)}\n`);
-
-  // Create run logger
-  const runLogger = await createRunLogger(logDir);
-  console.log(`Logs: ${runLogger.runDir}\n`);
-
-  // Fetch latest from git and run main setup
-  if (!dryRun) {
-    await fetchAllRepos(configContext);
-    await runMainSetup(configContext);
-  }
-
   // Fetch flags from feature flag system
-  console.log('\nFetching stale flags...');
   if (config.fetcher.type === 'manual') {
     throw new Error('Manual fetcher requires --input flag');
   }
 
+  const logger = consoleLogger;
+  logger.log('\nFetching stale flags...');
   const flags = await fetchFlags(config.fetcher);
-  console.log(`Fetched ${flags.length} stale flags\n`);
+  logger.log(`Fetched ${flags.length} stale flags\n`);
 
-  if (flags.length === 0) {
-    console.log('No stale flags found. Nothing to do.');
-    const summary = createSummary(
-      startTime,
-      config.fetcher.type,
-      flags,
-      [],
-      runLogger.runDir,
-      0,
-      runtime,
-      dryRun
-    );
-    await runLogger.writeSummary(summary);
-    return summary;
-  }
-
-  // Filter out flags with existing open PRs
-  console.log('Checking for existing PRs...');
-  const { flagsToProcess: flagsAfterPrCheck, skippedFlags } = await filterFlagsWithExistingPRs(
-    flags,
-    configContext,
-    dryRun
-  );
-
-  console.log(`  ${flagsAfterPrCheck.length} flags passed PR check (${skippedFlags.length} skipped)\n`);
-
-  if (flagsAfterPrCheck.length === 0) {
-    console.log('No flags to process after PR filtering. Nothing to do.');
-    const summary = createSummary(
-      startTime,
-      config.fetcher.type,
-      flags,
-      skippedFlags,
-      runLogger.runDir,
-      0,
-      runtime,
-      dryRun
-    );
-    await runLogger.writeSummary(summary);
-    return summary;
-  }
-
-  // Filter out flags with no code references
-  const { flagsWithCode, flagsWithoutCode } = await filterFlagsWithCodeReferences(
-    flagsAfterPrCheck,
-    configContext
-  );
-  const allSkipped = [...skippedFlags, ...flagsWithoutCode];
-
-  console.log(`  ${flagsWithCode.length} flags have code references (${flagsWithoutCode.length} have no code)\n`);
-
-  if (flagsWithCode.length === 0) {
-    console.log('No flags with code references to process. Nothing to do.');
-    const summary = createSummary(
-      startTime,
-      config.fetcher.type,
-      flags,
-      allSkipped,
-      runLogger.runDir,
-      0,
-      runtime,
-      dryRun
-    );
-    await runLogger.writeSummary(summary);
-    return summary;
-  }
-
-  // Process flags until we hit maxPrs PRs created
-  const { results, remaining } = await processFlags(
-    flagsWithCode,
-    { configContext, concurrency, dryRun, maxPrs },
-    runLogger,
-    allSkipped
-  );
-
-  // Generate summary
-  const summary = createSummary(
-    startTime,
-    config.fetcher.type,
-    flags,
-    results,
-    runLogger.runDir,
-    remaining.length,
-    runtime,
-    dryRun
-  );
-  await runLogger.writeSummary(summary);
-
-  // Print summary
-  printSummary(summary);
-
-  return summary;
+  return runWithFlags(config, flags, config.fetcher.type, logger);
 }
 
 /**
@@ -775,20 +656,36 @@ export async function runWithInput(
   config: Omit<OrchestratorConfig, 'fetcher'> & { inputFile: string }
 ): Promise<RunSummary> {
   const content = await fs.readFile(config.inputFile, 'utf-8');
-  const flags: FlagToRemove[] = JSON.parse(content);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    throw new Error(`Failed to parse input file as JSON: ${config.inputFile}`);
+  }
+
+  const result = FlagToRemoveSchema.safeParse(parsed);
+  if (!result.success) {
+    const issues = result.error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('\n');
+    throw new Error(`Invalid input file: ${config.inputFile}\n${issues}`);
+  }
 
   const fullConfig: OrchestratorConfig = {
     ...config,
     fetcher: { type: 'manual' },
   };
 
-  return runWithFlags(fullConfig, flags);
+  return runWithFlags(fullConfig, result.data, `file (${config.inputFile})`, consoleLogger);
 }
 
 /**
- * Internal: run with pre-loaded flags
+ * Internal: shared orchestration logic for both fetcher and file-based runs
  */
-async function runWithFlags(config: OrchestratorConfig, flags: FlagToRemove[]): Promise<RunSummary> {
+async function runWithFlags(
+  config: OrchestratorConfig,
+  flags: FlagToRemove[],
+  fetcherLabel: string,
+  logger: Logger
+): Promise<RunSummary> {
   const startTime = new Date();
   const { configContext } = config;
   const { reposDir } = configContext;
@@ -796,56 +693,49 @@ async function runWithFlags(config: OrchestratorConfig, flags: FlagToRemove[]): 
   const { concurrency, maxPrs, logDir } = runtime;
   const dryRun = config.dryRun ?? false;
 
-  console.log(`\n${'═'.repeat(60)}`);
-  console.log('                    bye-bye-flag Orchestrator');
-  console.log(`${'═'.repeat(60)}`);
-  console.log(`Repos directory: ${reposDir}`);
-  console.log(`Concurrency: ${concurrency}`);
-  console.log(`Max PRs: ${maxPrs}`);
-  console.log(`Dry run: ${dryRun}`);
-  console.log(`Input: file (${flags.length} flags)`);
-  console.log(`${'═'.repeat(60)}\n`);
+  logger.log(`\n${'═'.repeat(60)}`);
+  logger.log('                    bye-bye-flag Orchestrator');
+  logger.log(`${'═'.repeat(60)}`);
+  logger.log(`Repos directory: ${reposDir}`);
+  logger.log(`Concurrency: ${concurrency}`);
+  logger.log(`Max PRs: ${maxPrs}`);
+  logger.log(`Dry run: ${dryRun}`);
+  logger.log(`Input: ${fetcherLabel} (${flags.length} flags)`);
+  logger.log(`${'═'.repeat(60)}\n`);
 
   const runLogger = await createRunLogger(logDir);
-  console.log(`Logs: ${runLogger.runDir}\n`);
+  logger.log(`Logs: ${runLogger.runDir}\n`);
 
   // Fetch latest from git and run main setup
   if (!dryRun) {
-    await fetchAllRepos(configContext);
-    await runMainSetup(configContext);
+    logger.log('Fetching latest from origin...');
+    await fetchAllRepos(configContext, logger);
+    await runMainSetup(configContext, logger);
   }
 
   if (flags.length === 0) {
-    console.log('No flags in input. Nothing to do.');
-    const summary = createSummary(
-      startTime,
-      config.fetcher.type,
-      flags,
-      [],
-      runLogger.runDir,
-      0,
-      runtime,
-      dryRun
-    );
+    logger.log('No flags to process. Nothing to do.');
+    const summary = createSummary(startTime, fetcherLabel, flags, [], runLogger.runDir, 0, runtime, dryRun);
     await runLogger.writeSummary(summary);
     return summary;
   }
 
   // Filter out flags with existing open PRs
-  console.log('\nChecking for existing PRs...');
+  logger.log('Checking for existing PRs...');
   const { flagsToProcess: flagsAfterPrCheck, skippedFlags } = await filterFlagsWithExistingPRs(
     flags,
     configContext,
-    dryRun
+    dryRun,
+    logger
   );
 
-  console.log(`  ${flagsAfterPrCheck.length} flags passed PR check (${skippedFlags.length} skipped)\n`);
+  logger.log(`  ${flagsAfterPrCheck.length} flags passed PR check (${skippedFlags.length} skipped)\n`);
 
   if (flagsAfterPrCheck.length === 0) {
-    console.log('No flags to process after PR filtering. Nothing to do.');
+    logger.log('No flags to process after PR filtering. Nothing to do.');
     const summary = createSummary(
       startTime,
-      config.fetcher.type,
+      fetcherLabel,
       flags,
       skippedFlags,
       runLogger.runDir,
@@ -860,17 +750,20 @@ async function runWithFlags(config: OrchestratorConfig, flags: FlagToRemove[]): 
   // Filter out flags with no code references
   const { flagsWithCode, flagsWithoutCode } = await filterFlagsWithCodeReferences(
     flagsAfterPrCheck,
-    configContext
+    configContext,
+    logger
   );
   const allSkipped = [...skippedFlags, ...flagsWithoutCode];
 
-  console.log(`  ${flagsWithCode.length} flags have code references (${flagsWithoutCode.length} have no code)\n`);
+  logger.log(
+    `  ${flagsWithCode.length} flags have code references (${flagsWithoutCode.length} have no code)\n`
+  );
 
   if (flagsWithCode.length === 0) {
-    console.log('No flags with code references to process. Nothing to do.');
+    logger.log('No flags with code references to process. Nothing to do.');
     const summary = createSummary(
       startTime,
-      config.fetcher.type,
+      fetcherLabel,
       flags,
       allSkipped,
       runLogger.runDir,
@@ -887,13 +780,14 @@ async function runWithFlags(config: OrchestratorConfig, flags: FlagToRemove[]): 
     flagsWithCode,
     { configContext, concurrency, dryRun, maxPrs },
     runLogger,
-    allSkipped
+    allSkipped,
+    logger
   );
 
   // Generate summary
   const summary = createSummary(
     startTime,
-    config.fetcher.type,
+    fetcherLabel,
     flags,
     results,
     runLogger.runDir,
@@ -904,7 +798,7 @@ async function runWithFlags(config: OrchestratorConfig, flags: FlagToRemove[]): 
   await runLogger.writeSummary(summary);
 
   // Print summary
-  printSummary(summary);
+  printSummary(summary, logger);
 
   return summary;
 }
@@ -961,49 +855,49 @@ function createSummary(
   };
 }
 
-function printSummary(summary: RunSummary): void {
+function printSummary(summary: RunSummary, logger: Logger): void {
   const duration = new Date(summary.endTime).getTime() - new Date(summary.startTime).getTime();
 
-  console.log(`\n${'═'.repeat(60)}`);
-  console.log('                    bye-bye-flag Run Complete');
-  console.log(`${'═'.repeat(60)}`);
-  console.log(`Fetcher: ${summary.input.fetcherType} (found ${summary.input.totalFetched} stale flags)`);
-  console.log(`Duration: ${formatDuration(duration)}`);
-  console.log(`Processed: ${summary.input.processed} flags`);
-  console.log('');
-  console.log(`  ✓ ${summary.results.prsCreated} PRs created`);
-  console.log(`  ○ ${summary.results.noChanges} no changes needed`);
-  console.log(`  ○ ${summary.results.noCodeReferences} no code references`);
-  console.log(`  ✗ ${summary.results.failed} failed`);
-  console.log(`  ⊘ ${summary.results.skipped} skipped`);
+  logger.log(`\n${'═'.repeat(60)}`);
+  logger.log('                    bye-bye-flag Run Complete');
+  logger.log(`${'═'.repeat(60)}`);
+  logger.log(`Fetcher: ${summary.input.fetcherType} (found ${summary.input.totalFetched} stale flags)`);
+  logger.log(`Duration: ${formatDuration(duration)}`);
+  logger.log(`Processed: ${summary.input.processed} flags`);
+  logger.log('');
+  logger.log(`  ✓ ${summary.results.prsCreated} PRs created`);
+  logger.log(`  ○ ${summary.results.noChanges} no changes needed`);
+  logger.log(`  ○ ${summary.results.noCodeReferences} no code references`);
+  logger.log(`  ✗ ${summary.results.failed} failed`);
+  logger.log(`  ⊘ ${summary.results.skipped} skipped`);
 
   if (summary.results.remaining > 0) {
-    console.log(`  … ${summary.results.remaining} remaining (maxPrs limit)`);
+    logger.log(`  … ${summary.results.remaining} remaining (maxPrs limit)`);
   }
 
   const prsCreatedFlags = summary.flags.filter((f) => f.prUrls && f.prUrls.length > 0);
   if (prsCreatedFlags.length > 0) {
-    console.log('\nPRs created:');
+    logger.log('\nPRs created:');
     for (const flag of prsCreatedFlags) {
       for (const url of flag.prUrls!) {
-        console.log(`  • ${flag.key}: ${url}`);
+        logger.log(`  • ${flag.key}: ${url}`);
       }
     }
   }
 
-  const skippedFlags = summary.flags.filter((f) => f.status === 'skipped' && f.skippedReason);
-  if (skippedFlags.length > 0) {
-    console.log('\nSkipped:');
-    for (const flag of skippedFlags) {
-      console.log(`  • ${flag.key}: ${flag.skippedReason}`);
+  const skippedFlagResults = summary.flags.filter((f) => f.status === 'skipped' && f.skippedReason);
+  if (skippedFlagResults.length > 0) {
+    logger.log('\nSkipped:');
+    for (const flag of skippedFlagResults) {
+      logger.log(`  • ${flag.key}: ${flag.skippedReason}`);
     }
   }
 
   const failedFlags = summary.flags.filter((f) => f.status === 'failed');
   if (failedFlags.length > 0) {
-    console.log('\nFailed:');
+    logger.log('\nFailed:');
     for (const flag of failedFlags) {
-      console.log(`  • ${flag.key}: ${flag.error}`);
+      logger.log(`  • ${flag.key}: ${flag.error}`);
     }
   }
 
@@ -1013,15 +907,15 @@ function printSummary(summary: RunSummary): void {
     (f) => f.status === 'complete' && f.skippedReason === 'No code references found'
   );
   if (noCodeFlags.length > 0) {
-    console.log('\nNo code references (safe to remove from feature flag system):');
+    logger.log('\nNo code references (safe to remove from feature flag system):');
 
     // Group by creator
     const byCreator = new Map<string, string[]>();
     for (const flag of noCodeFlags) {
       const creator = flag.createdBy || 'Unknown';
-      const flags = byCreator.get(creator) || [];
-      flags.push(flag.key);
-      byCreator.set(creator, flags);
+      const creatorFlags = byCreator.get(creator) || [];
+      creatorFlags.push(flag.key);
+      byCreator.set(creator, creatorFlags);
     }
 
     // Sort by creator name, with "Unknown" last
@@ -1032,21 +926,21 @@ function printSummary(summary: RunSummary): void {
     });
 
     for (const creator of sortedCreators) {
-      const flags = byCreator.get(creator)!;
-      console.log(`  ${creator}:`);
-      for (const key of flags) {
-        console.log(`    • ${key}`);
+      const creatorFlags = byCreator.get(creator)!;
+      logger.log(`  ${creator}:`);
+      for (const key of creatorFlags) {
+        logger.log(`    • ${key}`);
       }
     }
   }
 
-  console.log(`\nLogs: ${summary.logDir}`);
+  logger.log(`\nLogs: ${summary.logDir}`);
 
   if (summary.results.remaining > 0) {
-    console.log(`\nTo continue processing remaining flags, run the command again.`);
+    logger.log(`\nTo continue processing remaining flags, run the command again.`);
   }
 
-  console.log('');
+  logger.log('');
 }
 
 function formatDuration(ms: number): string {

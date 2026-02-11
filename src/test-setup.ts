@@ -31,7 +31,7 @@ async function runCommand(cmd: string, cwd: string, shellInit?: string): Promise
     });
     console.log(`    ✓ Success`);
     return true;
-  } catch (error) {
+  } catch {
     console.log(`    ✗ Failed`);
     return false;
   }
@@ -98,8 +98,7 @@ async function testRepo(
     console.log(`\n--- Setup Commands (on ${worktreePath}) ---`);
     const mainRepoPath = path.resolve(reposDir, repoName);
 
-    const setupCommands =
-      repoConfig.setup !== undefined ? repoConfig.setup : config.repoDefaults?.setup;
+    const setupCommands = repoConfig.setup !== undefined ? repoConfig.setup : config.repoDefaults?.setup;
     if (!setupCommands) {
       console.error(
         `Missing setup commands for repo "${repoName}". Add repos.${repoName}.setup or repoDefaults.setup to bye-bye-flag-config.json`
@@ -107,9 +106,9 @@ async function testRepo(
       return false;
     }
 
-    for (let cmd of setupCommands) {
+    for (const rawCmd of setupCommands) {
       // Substitute ${MAIN_REPO}
-      cmd = cmd.replace(/\$\{MAIN_REPO\}/g, mainRepoPath);
+      const cmd = rawCmd.replace(/\$\{MAIN_REPO\}/g, mainRepoPath);
 
       const success = await runCommand(cmd, worktreePath, shellInit);
       if (!success) {
@@ -143,10 +142,10 @@ async function main() {
     args,
     options: {
       'target-repos': { type: 'string' },
-      'repo': { type: 'string' },
+      repo: { type: 'string' },
       'skip-main-setup': { type: 'boolean', default: false },
       'skip-worktree': { type: 'boolean', default: false },
-      'help': { type: 'boolean', short: 'h' },
+      help: { type: 'boolean', short: 'h' },
     },
   });
 

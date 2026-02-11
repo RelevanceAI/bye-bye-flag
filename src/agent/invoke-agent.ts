@@ -125,20 +125,18 @@ Output to convert:
 ${truncatedOutput}`;
 }
 
-async function normalizeAgentOutputWithSameAgent(
-  options: {
-    kind: string;
-    command: string;
-    args: string[];
-    promptMode: 'stdin' | 'arg';
-    promptArg: string;
-    timeoutMs: number;
-    workspacePath: string;
-    shellInit?: string;
-    logger: Logger;
-    rawOutput: string;
-  }
-): Promise<AgentOutput | null> {
+async function normalizeAgentOutputWithSameAgent(options: {
+  kind: string;
+  command: string;
+  args: string[];
+  promptMode: 'stdin' | 'arg';
+  promptArg: string;
+  timeoutMs: number;
+  workspacePath: string;
+  shellInit?: string;
+  logger: Logger;
+  rawOutput: string;
+}): Promise<AgentOutput | null> {
   const {
     kind,
     command,
@@ -155,10 +153,7 @@ async function normalizeAgentOutputWithSameAgent(
   logger.log(`[${kind}] Parse failed, attempting normalization retry with the same agent...`);
 
   const normalizePrompt = buildNormalizationPrompt(rawOutput);
-  const normalizeArgs =
-    promptMode === 'arg'
-      ? [...args, promptArg, normalizePrompt]
-      : args;
+  const normalizeArgs = promptMode === 'arg' ? [...args, promptArg, normalizePrompt] : args;
 
   const normalizeResult = await runCli(
     command,
@@ -273,10 +268,7 @@ export async function invokeAgent(options: InvokeAgentOptions): Promise<InvokeAg
     logger = consoleLogger,
   } = options;
 
-  const invocationArgs =
-    promptMode === 'arg'
-      ? [...args, promptArg, prompt]
-      : args;
+  const invocationArgs = promptMode === 'arg' ? [...args, promptArg, prompt] : args;
 
   const shellInit = await getShellInit(reposDir, undefined, configPath);
 
@@ -321,9 +313,7 @@ export async function invokeAgent(options: InvokeAgentOptions): Promise<InvokeAg
 
   if (!output) {
     const preview =
-      result.stdout.length > 800
-        ? result.stdout.slice(0, 800) + '\n… (truncated)'
-        : result.stdout;
+      result.stdout.length > 800 ? result.stdout.slice(0, 800) + '\n… (truncated)' : result.stdout;
     throw new Error(`Failed to parse ${kind} output as AgentOutput.\n\nOutput preview:\n${preview}`);
   }
 

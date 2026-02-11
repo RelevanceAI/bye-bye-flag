@@ -104,9 +104,7 @@ export async function readWorkspaceMetadata(workspacePath: string): Promise<Work
  * Creates worktrees for all git repos configured in bye-bye-flag-config.json
  * Returns a workspace root containing all worktrees
  */
-export async function setupMultiRepoWorktrees(
-  options: ScaffoldOptions
-): Promise<ScaffoldResult> {
+export async function setupMultiRepoWorktrees(options: ScaffoldOptions): Promise<ScaffoldResult> {
   const { reposDir, configPath, branchName, deleteRemoteBranch = true, logger = consoleLogger } = options;
   const config = await readConfig(reposDir, configPath);
   const worktreeBasePath = config.worktrees?.basePath ?? CONFIG.worktreeBasePath;
@@ -133,7 +131,7 @@ export async function setupMultiRepoWorktrees(
       }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        throw new Error(`Configured repo "${repoName}" does not exist in ${reposDir}`);
+        throw new Error(`Configured repo "${repoName}" does not exist in ${reposDir}`, { cause: error });
       }
       throw error;
     }
@@ -174,11 +172,9 @@ export async function setupMultiRepoWorktrees(
 
       // Create worktree with the new branch based on the configured origin base branch
       logger.log(`[${repoName}] Creating worktree on branch ${branchName}...`);
-      await execa(
-        'git',
-        ['worktree', 'add', '-b', branchName, worktreePath, `origin/${baseBranch}`],
-        { cwd: repoPath }
-      );
+      await execa('git', ['worktree', 'add', '-b', branchName, worktreePath, `origin/${baseBranch}`], {
+        cwd: repoPath,
+      });
     });
 
     // Setup node and run setup commands
@@ -239,14 +235,18 @@ export async function setupMultiRepoWorktrees(
 /**
  * Removes a single worktree
  */
-async function cleanupWorktree(repoPath: string, worktreePath: string): Promise<void> {
-  console.log(`Cleaning up worktree at ${worktreePath}...`);
+async function cleanupWorktree(
+  repoPath: string,
+  worktreePath: string,
+  logger: Logger = consoleLogger
+): Promise<void> {
+  logger.log(`Cleaning up worktree at ${worktreePath}...`);
   try {
     await execa('git', ['worktree', 'remove', worktreePath, '--force'], {
       cwd: repoPath,
     });
   } catch (error) {
-    console.warn(`Failed to remove worktree: ${error}`);
+    logger.error(`Failed to remove worktree: ${error}`);
   }
 }
 
@@ -396,8 +396,7 @@ const ByeByeFlagConfigSchema = z
 
       const hasBaseBranch =
         (typeof repoCfg.baseBranch === 'string' && repoCfg.baseBranch.trim().length > 0) ||
-        (typeof cfg.repoDefaults?.baseBranch === 'string' &&
-          cfg.repoDefaults.baseBranch.trim().length > 0);
+        (typeof cfg.repoDefaults?.baseBranch === 'string' && cfg.repoDefaults.baseBranch.trim().length > 0);
       if (!hasBaseBranch) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -455,9 +454,9 @@ export async function readConfig(reposDir: string, configPath?: string): Promise
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
     if (code !== 'ENOENT') {
       const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Failed to read config file: ${preferredPath}\n${message}`);
+      throw new Error(`Failed to read config file: ${preferredPath}\n${message}`, { cause: error });
     }
-    throw new Error(`Missing required config file: ${preferredPath}`);
+    throw new Error(`Missing required config file: ${preferredPath}`, { cause: error });
   }
 
   try {
@@ -467,10 +466,8 @@ export async function readConfig(reposDir: string, configPath?: string): Promise
     return cachedConfig;
   } catch (error) {
     if (error instanceof z.ZodError) {
-      const issues = error.issues
-        .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
-        .join('\n');
-      throw new Error(`Invalid config file: ${preferredPath}\n${issues}`);
+      const issues = error.issues.map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`).join('\n');
+      throw new Error(`Invalid config file: ${preferredPath}\n${issues}`, { cause: error });
     }
     throw error;
   }
@@ -516,8 +513,7 @@ async function runSetupCommands(
   const shellInitCmd = repoConfig.shellInit ?? config.repoDefaults?.shellInit;
   const shellInit = shellInitCmd ? `${shellInitCmd} && ` : '';
 
-  const setupCommands =
-    repoConfig.setup !== undefined ? repoConfig.setup : config.repoDefaults?.setup;
+  const setupCommands = repoConfig.setup !== undefined ? repoConfig.setup : config.repoDefaults?.setup;
   if (!setupCommands) {
     throw new Error(
       `Missing setup commands for repo "${repoName}". Add repos.${repoName}.setup or repoDefaults.setup to bye-bye-flag-config.json`
@@ -525,9 +521,9 @@ async function runSetupCommands(
   }
 
   // Run each setup command (output suppressed, errors shown on failure)
-  for (let cmd of setupCommands) {
+  for (const rawCmd of setupCommands) {
     // Substitute ${MAIN_REPO} with the path to the main repo
-    cmd = cmd.replace(/\$\{MAIN_REPO\}/g, mainRepoPath);
+    const cmd = rawCmd.replace(/\$\{MAIN_REPO\}/g, mainRepoPath);
 
     logger.log(`  Running: ${cmd}`);
     try {
@@ -537,8 +533,14 @@ async function runSetupCommands(
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const stdout = typeof (error as { stdout?: unknown }).stdout === 'string' ? (error as { stdout: string }).stdout : '';
-      const stderr = typeof (error as { stderr?: unknown }).stderr === 'string' ? (error as { stderr: string }).stderr : '';
+      const stdout =
+        typeof (error as { stdout?: unknown }).stdout === 'string'
+          ? (error as { stdout: string }).stdout
+          : '';
+      const stderr =
+        typeof (error as { stderr?: unknown }).stderr === 'string'
+          ? (error as { stderr: string }).stderr
+          : '';
 
       const outputParts = [
         stdout.trim() ? `stdout:\n${stdout.trimEnd()}` : '',
@@ -549,7 +551,9 @@ async function runSetupCommands(
       const clippedOutput = output.length > 4000 ? output.slice(0, 4000) + '\n… (truncated)' : output;
 
       throw new Error(
-        `Setup command "${cmd}" failed in ${repoName}: ${message}` + (clippedOutput ? `\n\n${clippedOutput}` : '')
+        `Setup command "${cmd}" failed in ${repoName}: ${message}` +
+          (clippedOutput ? `\n\n${clippedOutput}` : ''),
+        { cause: error }
       );
     }
   }

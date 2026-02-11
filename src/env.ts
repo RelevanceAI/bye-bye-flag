@@ -1,6 +1,5 @@
 export function loadEnvFileIfExists(envFilePath: string = '.env'): void {
-  const loadEnvFile = (process as NodeJS.Process & { loadEnvFile?: (path?: string) => void })
-    .loadEnvFile;
+  const loadEnvFile = (process as NodeJS.Process & { loadEnvFile?: (path?: string) => void }).loadEnvFile;
 
   if (typeof loadEnvFile !== 'function') return;
 

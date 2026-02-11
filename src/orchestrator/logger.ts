@@ -93,10 +93,7 @@ export async function createRunLogger(baseDir: string): Promise<RunLogger> {
       stream.write(line);
     };
 
-    const finish = async (
-      status: Exclude<LogStatus, 'running'>,
-      summary?: string
-    ): Promise<void> => {
+    const finish = async (status: Exclude<LogStatus, 'running'>, summary?: string): Promise<void> => {
       // Write footer
       const footer = [
         '',

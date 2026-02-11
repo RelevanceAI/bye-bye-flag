@@ -1,5 +1,16 @@
 #!/usr/bin/env node
 
+// Check Node.js version (requires 24+ for native TypeScript support)
+const [major] = process.versions.node.split('.').map(Number);
+if (major < 24) {
+  console.error(
+    `Error: bye-bye-flag requires Node.js 24 or later (current: ${process.versions.node}).\n` +
+      `Native TypeScript execution is only available in Node.js 24+.\n` +
+      `Install it via: nvm install 24 && nvm use 24`
+  );
+  process.exit(1);
+}
+
 import { parseArgs } from 'node:util';
 import { removeFlag } from './agent/index.ts';
 import { run, runWithInput } from './orchestrator/index.ts';

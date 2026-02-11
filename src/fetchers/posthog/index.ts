@@ -113,11 +113,7 @@ export async function fetchFlags(config: PostHogFetcherConfig): Promise<FlagToRe
   return staleFlags;
 }
 
-async function fetchFlagsForProject(
-  projectId: string,
-  apiKey: string,
-  host: string
-): Promise<PostHogFlag[]> {
+async function fetchFlagsForProject(projectId: string, apiKey: string, host: string): Promise<PostHogFlag[]> {
   const allFlags: PostHogFlag[] = [];
   let url: string | null = `${host}/api/projects/${projectId}/feature_flags/`;
 
@@ -275,7 +271,9 @@ function analyzeFlagsAcrossProjects(
       : `${rollout}% rollout for ${daysSinceModified} days`;
 
     // Include all distinct creators when flags differ across projects/environments.
-    const creators = [...new Set(infos.map((i) => i.createdBy).filter((creator): creator is string => Boolean(creator)))];
+    const creators = [
+      ...new Set(infos.map((i) => i.createdBy).filter((creator): creator is string => Boolean(creator))),
+    ];
     const createdBy = creators.length > 0 ? creators.join(', ') : undefined;
 
     staleFlags.push({
@@ -292,9 +290,7 @@ function analyzeFlagsAcrossProjects(
   }
 
   // Sort by oldest first (prioritize removing older flags)
-  staleFlags.sort(
-    (a, b) => new Date(a.lastModified!).getTime() - new Date(b.lastModified!).getTime()
-  );
+  staleFlags.sort((a, b) => new Date(a.lastModified!).getTime() - new Date(b.lastModified!).getTime());
 
   return staleFlags;
 }
@@ -319,8 +315,8 @@ export async function showAllFlags(config: PostHogFetcherConfig): Promise<void> 
 
   for (const projectId of projectIds) {
     const flags = await fetchFlagsForProject(projectId, apiKey, host);
-    console.error(`\nProject ${projectId}:`);
-    for (const flag of flags.slice(0, 20)) {
+    console.error(`\nProject ${projectId} (${flags.length} flags):`);
+    for (const flag of flags) {
       const rollout = getRolloutPercentage(flag);
       const lastMod = new Date(flag.updated_at);
       const hasPayloadFlag = hasPayload(flag);
@@ -331,9 +327,6 @@ export async function showAllFlags(config: PostHogFetcherConfig): Promise<void> 
           `payload=${hasPayloadFlag}, variants=${hasVariantsFlag}, ` +
           `active=${flag.active}`
       );
-    }
-    if (flags.length > 20) {
-      console.error(`  ... and ${flags.length - 20} more`);
     }
   }
 }

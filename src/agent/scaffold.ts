@@ -34,6 +34,11 @@ interface WorkspaceMetadata {
   createdAt: string;
 }
 
+interface ParsedWorktreeEntry {
+  path: string;
+  branchRef?: string;
+}
+
 const WORKSPACE_METADATA_FILENAME = '.bye-bye-flag-workspace.json';
 const repoOperationLocks = new Map<string, Promise<void>>();
 
@@ -100,6 +105,56 @@ export async function readWorkspaceMetadata(workspacePath: string): Promise<Work
   }
 }
 
+function parseWorktreeListPorcelain(output: string): ParsedWorktreeEntry[] {
+  const entries: ParsedWorktreeEntry[] = [];
+  let current: ParsedWorktreeEntry | null = null;
+
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) {
+      if (current) {
+        entries.push(current);
+        current = null;
+      }
+      continue;
+    }
+
+    if (line.startsWith('worktree ')) {
+      if (current) {
+        entries.push(current);
+      }
+      current = { path: line.slice('worktree '.length).trim() };
+      continue;
+    }
+
+    if (!current) continue;
+    if (line.startsWith('branch ')) {
+      current.branchRef = line.slice('branch '.length).trim();
+    }
+  }
+
+  if (current) {
+    entries.push(current);
+  }
+
+  return entries;
+}
+
+async function findWorktreePathForBranch(repoPath: string, branchName: string): Promise<string | null> {
+  const branchRef = `refs/heads/${branchName}`;
+  const result = await execa('git', ['worktree', 'list', '--porcelain'], {
+    cwd: repoPath,
+    reject: false,
+  });
+  if (result.exitCode !== 0) {
+    return null;
+  }
+
+  const entries = parseWorktreeListPorcelain(result.stdout);
+  const match = entries.find((entry) => entry.branchRef === branchRef);
+  return match?.path ?? null;
+}
+
 /**
  * Creates worktrees for all git repos configured in bye-bye-flag-config.json
  * Returns a workspace root containing all worktrees
@@ -158,6 +213,29 @@ export async function setupMultiRepoWorktrees(options: ScaffoldOptions): Promise
         // Doesn't exist, fine
       }
 
+      // If this branch is still checked out in another worktree, clear it first.
+      const conflictingWorktree = await findWorktreePathForBranch(repoPath, branchName);
+      if (conflictingWorktree && path.resolve(conflictingWorktree) !== path.resolve(worktreePath)) {
+        const normalizedBase = path.resolve(worktreeBasePath);
+        const normalizedConflict = path.resolve(conflictingWorktree);
+        const isManagedWorktree =
+          normalizedConflict === normalizedBase ||
+          normalizedConflict.startsWith(`${normalizedBase}${path.sep}`);
+
+        if (!isManagedWorktree) {
+          throw new Error(
+            `Branch "${branchName}" is already checked out at "${conflictingWorktree}" (outside managed worktree base "${worktreeBasePath}"). Remove it manually and retry.`
+          );
+        }
+
+        logger.log(
+          `[${repoName}] Removing stale worktree using branch ${branchName}: ${conflictingWorktree}`
+        );
+        await execa('git', ['worktree', 'remove', conflictingWorktree, '--force'], {
+          cwd: repoPath,
+        });
+      }
+
       // Delete existing branch if it exists (local and remote) so we start fresh
       // Using reject: false so these won't throw even if branch doesn't exist
       await execa('git', ['branch', '-D', branchName], { cwd: repoPath, reject: false });
@@ -170,9 +248,9 @@ export async function setupMultiRepoWorktrees(options: ScaffoldOptions): Promise
 
       const baseBranch = getRepoBaseBranch(config, repoName);
 
-      // Create worktree with the new branch based on the configured origin base branch
+      // Create (or reset) worktree branch from the configured origin base branch.
       logger.log(`[${repoName}] Creating worktree on branch ${branchName}...`);
-      await execa('git', ['worktree', 'add', '-b', branchName, worktreePath, `origin/${baseBranch}`], {
+      await execa('git', ['worktree', 'add', '-B', branchName, worktreePath, `origin/${baseBranch}`], {
         cwd: repoPath,
       });
     });

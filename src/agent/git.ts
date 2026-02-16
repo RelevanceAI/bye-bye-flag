@@ -279,9 +279,11 @@ export async function findExistingPR(repoPath: string, flagKey: string): Promise
       limit: 100,
     });
     return byFlag.get(flagKey) ?? null;
-  } catch {
-    // gh command failed, assume no existing PR
-    return null;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to discover existing PRs for "${flagKey}" in ${repoPath}: ${message}`, {
+      cause: error,
+    });
   }
 }
 
@@ -292,9 +294,11 @@ export async function findExistingPR(repoPath: string, flagKey: string): Promise
 export async function fetchAllFlagPRs(repoPath: string): Promise<Map<string, ExistingPR>> {
   try {
     return await fetchPRSafetyStates(repoPath, { limit: 500 });
-  } catch {
-    // gh command failed, return empty map
-    return new Map<string, ExistingPR>();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to fetch PRs for ${repoPath}: ${message}`, {
+      cause: error,
+    });
   }
 }
 

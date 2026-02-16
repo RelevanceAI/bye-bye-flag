@@ -328,7 +328,7 @@ async function filterFlagsWithExistingPRs(
 
   // Fetch all flag PRs from all repos in parallel (much faster than per-flag queries)
   const prsByRepo = new Map<string, Map<string, ExistingPR>>();
-  await Promise.all(
+  const prFetchResults = await Promise.allSettled(
     repoNames.map(async (repoName) => {
       const repoPath = path.join(reposDir, repoName);
       logger.log(`  Fetching PRs from ${repoName}...`);
@@ -356,6 +356,26 @@ async function filterFlagsWithExistingPRs(
       }
     })
   );
+
+  const prFetchFailures = prFetchResults
+    .map((result, index) => ({ result, repoName: repoNames[index] }))
+    .filter(
+      (entry): entry is { result: PromiseRejectedResult; repoName: string } =>
+        entry.result.status === 'rejected'
+    );
+
+  if (prFetchFailures.length > 0) {
+    const failureSummary = prFetchFailures
+      .map(({ repoName, result }) => {
+        const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        return `${repoName}: ${reason}`;
+      })
+      .join('\n');
+
+    throw new Error(
+      `PR discovery failed; refusing to continue to avoid unsafe cleanup/duplicate PR creation.\n${failureSummary}`
+    );
+  }
 
   // Clean up stale worktrees using the PR data we just fetched
   if (!dryRun) {

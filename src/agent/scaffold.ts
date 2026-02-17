@@ -4,6 +4,7 @@ import * as fs from 'fs/promises';
 import { z } from 'zod';
 import { CONFIG } from '../config.ts';
 import { consoleLogger, type Logger } from '../types.ts';
+import { getAgentPreset } from './presets/index.ts';
 
 export interface ScaffoldOptions {
   reposDir: string; // Directory containing bye-bye-flag-config.json and repo subdirectories
@@ -430,7 +431,8 @@ const AgentConfigSchema = z
      */
     sessionIdRegex: z.string().min(1).optional(),
     /**
-     * Optional resume command templates for PR metadata.
+     * Resume command templates for PR metadata.
+     * withoutSessionId is required either here or via the built-in preset.
      */
     resume: z
       .object({
@@ -447,6 +449,17 @@ const AgentConfigSchema = z
         code: z.ZodIssueCode.custom,
         path: ['promptArg'],
         message: 'promptArg is required when promptMode is "arg".',
+      });
+    }
+
+    const preset = getAgentPreset(cfg.type);
+    const resolvedWithoutSessionResume = cfg.resume?.withoutSessionId ?? preset?.resume.withoutSessionId;
+    if (!resolvedWithoutSessionResume) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['resume', 'withoutSessionId'],
+        message:
+          'resume.withoutSessionId is required (set it in config or use an agent preset that defines it).',
       });
     }
   });

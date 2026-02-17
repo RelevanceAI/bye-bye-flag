@@ -1,6 +1,6 @@
 export interface AgentResumeTemplates {
+  withoutSessionId: string;
   withSessionId?: string;
-  withoutSessionId?: string;
 }
 
 export interface SessionIdConfig {
@@ -15,6 +15,6 @@ export interface AgentPreset {
   promptArg?: string;
   versionArgs: string[];
   sessionIdRegex?: string;
-  resume?: AgentResumeTemplates;
+  resume: AgentResumeTemplates;
   sessionId?: SessionIdConfig;
 }

@@ -3,7 +3,6 @@ import { parseAgentOutputFromText } from './output.ts';
 import { getShellInit } from './scaffold.ts';
 import { registerChildProcess } from '../process-tracker.ts';
 import { type AgentOutput, type Logger, consoleLogger } from '../types.ts';
-import type { AgentResumeTemplates } from './presets/types.ts';
 
 interface GenericRunResult {
   stdout: string;
@@ -18,13 +17,10 @@ export interface InvokeAgentOptions {
   configPath?: string;
   prompt: string;
   command: string;
-  args: string[];
   promptMode: 'stdin' | 'arg';
   promptArg: string;
   timeoutMs: number;
-  sessionIdRegex?: string;
-  resume?: AgentResumeTemplates;
-  sessionId?: string;
+  execution: AgentExecutionContract;
   logger?: Logger;
 }
 
@@ -34,58 +30,15 @@ export interface InvokeAgentResult {
   resumeCommand: string;
 }
 
+export interface AgentExecutionContract {
+  invocationArgs: string[];
+  retryArgs: string[];
+  extractSessionId(stdout: string): string | undefined;
+  buildResumeCommand(command: string, workspacePath: string, sessionId?: string): string;
+}
+
 function quoteShellArg(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
-}
-
-function renderResumeTemplate(
-  template: string,
-  values: { workspacePath: string; sessionId?: string; command: string }
-): string {
-  return template
-    .replace(/\{\{workspacePath\}\}/g, values.workspacePath)
-    .replace(/\{\{sessionId\}\}/g, values.sessionId ?? '')
-    .replace(/\{\{command\}\}/g, values.command);
-}
-
-function buildDefaultResumeCommand(command: string, workspacePath: string, sessionId?: string): string {
-  if (sessionId) {
-    return `cd ${workspacePath} && ${command} --resume ${sessionId}`;
-  }
-  return `cd ${workspacePath} && ${command} --resume`;
-}
-
-function getResumeCommand(
-  resume: AgentResumeTemplates | undefined,
-  command: string,
-  workspacePath: string,
-  sessionId?: string
-): string {
-  const withSessionTemplate = resume?.withSessionId;
-  const withoutSessionTemplate = resume?.withoutSessionId;
-
-  if (sessionId && withSessionTemplate) {
-    return renderResumeTemplate(withSessionTemplate, { workspacePath, sessionId, command });
-  }
-  if (!sessionId && withoutSessionTemplate) {
-    return renderResumeTemplate(withoutSessionTemplate, { workspacePath, command });
-  }
-  if (sessionId && !withSessionTemplate && withoutSessionTemplate) {
-    return renderResumeTemplate(withoutSessionTemplate, { workspacePath, sessionId, command });
-  }
-  return buildDefaultResumeCommand(command, workspacePath, sessionId);
-}
-
-function extractSessionId(stdout: string, sessionIdRegex?: string): string | undefined {
-  if (!sessionIdRegex) return undefined;
-  try {
-    const regex = new RegExp(sessionIdRegex, 'm');
-    const match = stdout.match(regex);
-    if (!match) return undefined;
-    return match[1] || match[0];
-  } catch {
-    return undefined;
-  }
 }
 
 const MAX_NORMALIZE_PROMPT_OUTPUT_LENGTH = 12_000;
@@ -258,17 +211,15 @@ export async function invokeAgent(options: InvokeAgentOptions): Promise<InvokeAg
     configPath,
     prompt,
     command,
-    args,
     promptMode,
     promptArg,
     timeoutMs,
-    sessionIdRegex,
-    resume,
-    sessionId: providedSessionId,
+    execution,
     logger = consoleLogger,
   } = options;
 
-  const invocationArgs = promptMode === 'arg' ? [...args, promptArg, prompt] : args;
+  const invocationArgs =
+    promptMode === 'arg' ? [...execution.invocationArgs, promptArg, prompt] : execution.invocationArgs;
 
   const shellInit = await getShellInit(reposDir, undefined, configPath);
 
@@ -296,12 +247,13 @@ export async function invokeAgent(options: InvokeAgentOptions): Promise<InvokeAg
   }
 
   const parsed = parseAgentOutputFromText(result.stdout);
+  const retryArgs = execution.retryArgs;
   const output =
     parsed ??
     (await normalizeAgentOutputWithSameAgent({
       kind,
       command,
-      args,
+      args: retryArgs,
       promptMode,
       promptArg,
       timeoutMs,
@@ -317,9 +269,8 @@ export async function invokeAgent(options: InvokeAgentOptions): Promise<InvokeAg
     throw new Error(`Failed to parse ${kind} output as AgentOutput.\n\nOutput preview:\n${preview}`);
   }
 
-  const extractedSessionId = extractSessionId(result.stdout, sessionIdRegex);
-  const sessionId = extractedSessionId ?? providedSessionId;
-  const resumeCommand = getResumeCommand(resume, command, workspacePath, sessionId);
+  const sessionId = execution.extractSessionId(result.stdout);
+  const resumeCommand = execution.buildResumeCommand(command, workspacePath, sessionId);
 
   return {
     output,

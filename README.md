@@ -238,7 +238,7 @@ Example files are available in `examples/`.
 - `agent.promptArg` (generic agents): prompt flag when `promptMode` is `arg` (default: `-p`)
 - `agent.versionArgs` (generic agents): args used for prerequisite check (default: `["--version"]`)
 - `agent.sessionIdRegex` (generic agents): regex to extract session IDs from output
-- `agent.resume` (generic agents): resume command templates used in PR metadata
+- `agent.resume` (generic agents): resume command templates used in PR metadata (`withoutSessionId` is required unless provided by a built-in preset)
 - Parse failures automatically trigger a second call to the same configured agent to normalize output into the expected JSON shape
 
 Built-in agent example:

@@ -10,7 +10,7 @@ import { execa } from 'execa';
 import { z } from 'zod';
 import { fetchFlags, type FlagToRemove, type FetcherConfig } from '../fetchers/index.ts';
 import { removeFlag } from '../agent/index.ts';
-import { fetchAllFlagPRs, type ExistingPR } from '../agent/git.ts';
+import { fetchAllFlagPRs, findExistingPR, type ExistingPR } from '../agent/git.ts';
 import { getRepoBaseBranch, readWorkspaceMetadata } from '../agent/scaffold.ts';
 import { createRunLogger, type FlagLogger, type LogStatus } from './logger.ts';
 import type { RemovalResult } from '../types.ts';
@@ -64,6 +64,47 @@ export interface RunSummary {
 }
 
 type FlagWithCodeReferences = FlagToRemove & { reposWithCode: string[] };
+
+async function findExactExistingPRsForFlag(
+  flagKey: string,
+  configContext: ConfigContext
+): Promise<Array<{ repoName: string; pr: ExistingPR }>> {
+  const { reposDir, config } = configContext;
+  const repoNames = Object.keys(config.repos);
+  const checks = await Promise.allSettled(
+    repoNames.map(async (repoName) => {
+      const repoPath = path.join(reposDir, repoName);
+      const pr = await findExistingPR(repoPath, flagKey);
+      return { repoName, pr };
+    })
+  );
+
+  const failures = checks
+    .map((result, index) => ({ result, repoName: repoNames[index] }))
+    .filter(
+      (entry): entry is { result: PromiseRejectedResult; repoName: string } =>
+        entry.result.status === 'rejected'
+    );
+
+  if (failures.length > 0) {
+    const summary = failures
+      .map(({ repoName, result }) => {
+        const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+        return `${repoName}: ${reason}`;
+      })
+      .join('\n');
+    throw new Error(`Failed exact existing-PR safety check for "${flagKey}":\n${summary}`);
+  }
+
+  const matches: Array<{ repoName: string; pr: ExistingPR }> = [];
+  for (const result of checks) {
+    if (result.status !== 'fulfilled') continue;
+    if (!result.value.pr) continue;
+    matches.push({ repoName: result.value.repoName, pr: result.value.pr });
+  }
+
+  return matches;
+}
 
 /**
  * Check which flags exist in the codebase (batch check)
@@ -478,6 +519,39 @@ async function processFlags(
       flagLogger.log(`Agent: ${agentKind}`);
       flagLogger.log(`Keep branch: ${flag.keepBranch}`);
       if (flag.reason) flagLogger.log(`Reason: ${flag.reason}`);
+
+      const exactExistingPRs = await findExactExistingPRsForFlag(flag.key, configContext);
+      const exactDeclinedPRs = exactExistingPRs.filter(({ pr }) => pr.declined);
+      if (exactDeclinedPRs.length > 0) {
+        const skippedReason = `Declined: ${exactDeclinedPRs.map(({ pr }) => pr.url).join(', ')}`;
+        logger.log(`⊘ Skipped: ${flag.key} (${skippedReason})`);
+        await flagLogger.finish('skipped', skippedReason);
+        results.push({
+          key: flag.key,
+          status: 'skipped',
+          skippedReason,
+          durationMs: Date.now() - flagStartTime,
+          createdBy: flag.createdBy,
+        });
+        consecutiveFailures = 0;
+        return 0;
+      }
+
+      const exactOpenPRs = exactExistingPRs.filter(({ pr }) => pr.state === 'OPEN');
+      if (exactOpenPRs.length > 0) {
+        const skippedReason = `Open PR: ${exactOpenPRs.map(({ pr }) => pr.url).join(', ')}`;
+        logger.log(`⊘ Skipped: ${flag.key} (${skippedReason})`);
+        await flagLogger.finish('skipped', skippedReason);
+        results.push({
+          key: flag.key,
+          status: 'skipped',
+          skippedReason,
+          durationMs: Date.now() - flagStartTime,
+          createdBy: flag.createdBy,
+        });
+        consecutiveFailures = 0;
+        return 0;
+      }
 
       const result = await removeFlag({
         flagKey: flag.key,

@@ -1,6 +1,6 @@
 {
   "name": "bye-bye-flag",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "Remove stale feature flags from codebases using AI",
   "license": "MIT",

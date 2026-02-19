@@ -43,6 +43,62 @@ interface ParsedWorktreeEntry {
 const WORKSPACE_METADATA_FILENAME = '.bye-bye-flag-workspace.json';
 const repoOperationLocks = new Map<string, Promise<void>>();
 
+async function canonicalizePath(pathValue: string): Promise<string> {
+  const resolved = path.resolve(pathValue);
+  const suffixSegments: string[] = [];
+  let currentPath = resolved;
+
+  while (true) {
+    try {
+      const real = await fs.realpath(currentPath);
+      return path.join(real, ...suffixSegments.reverse());
+    } catch {
+      const parent = path.dirname(currentPath);
+      if (parent === currentPath) {
+        return resolved;
+      }
+      suffixSegments.push(path.basename(currentPath));
+      currentPath = parent;
+    }
+  }
+}
+
+function isMissingWorktreeMetadataError(stderr: string): boolean {
+  const normalized = stderr.toLowerCase();
+  return (
+    normalized.includes('validation failed, cannot remove working tree') ||
+    (normalized.includes('.git') && normalized.includes('does not exist'))
+  );
+}
+
+async function forceRemoveWorktree(
+  repoPath: string,
+  worktreePath: string,
+  logger: Logger,
+  options?: { context?: string }
+): Promise<void> {
+  const contextPrefix = options?.context ? `${options.context}: ` : '';
+  const removeResult = await execa('git', ['worktree', 'remove', worktreePath, '--force'], {
+    cwd: repoPath,
+    reject: false,
+  });
+
+  if (removeResult.exitCode === 0) {
+    return;
+  }
+
+  const stderr = removeResult.stderr ?? '';
+  if (isMissingWorktreeMetadataError(stderr)) {
+    logger.log(`${contextPrefix}Detected stale worktree metadata, pruning and deleting ${worktreePath}...`);
+    await execa('git', ['worktree', 'prune'], { cwd: repoPath, reject: false });
+    await fs.rm(worktreePath, { recursive: true, force: true });
+    return;
+  }
+
+  const commandOutput = stderr || removeResult.stdout || `exit code ${removeResult.exitCode}`;
+  throw new Error(commandOutput);
+}
+
 async function withRepoOperationLock<T>(repoPath: string, action: () => Promise<T>): Promise<T> {
   const key = path.resolve(repoPath);
   const previous = (repoOperationLocks.get(key) ?? Promise.resolve()).catch(() => undefined);
@@ -209,32 +265,51 @@ export async function setupMultiRepoWorktrees(options: ScaffoldOptions): Promise
       try {
         await fs.access(worktreePath);
         logger.log(`[${repoName}] Cleaning up existing worktree...`);
-        await execa('git', ['worktree', 'remove', worktreePath, '--force'], { cwd: repoPath });
+        await forceRemoveWorktree(repoPath, worktreePath, logger, {
+          context: `[${repoName}]`,
+        });
       } catch {
         // Doesn't exist, fine
       }
 
       // If this branch is still checked out in another worktree, clear it first.
       const conflictingWorktree = await findWorktreePathForBranch(repoPath, branchName);
-      if (conflictingWorktree && path.resolve(conflictingWorktree) !== path.resolve(worktreePath)) {
-        const normalizedBase = path.resolve(worktreeBasePath);
-        const normalizedConflict = path.resolve(conflictingWorktree);
-        const isManagedWorktree =
-          normalizedConflict === normalizedBase ||
-          normalizedConflict.startsWith(`${normalizedBase}${path.sep}`);
-
-        if (!isManagedWorktree) {
-          throw new Error(
-            `Branch "${branchName}" is already checked out at "${conflictingWorktree}" (outside managed worktree base "${worktreeBasePath}"). Remove it manually and retry.`
+      const normalizedRequestedWorktree = await canonicalizePath(worktreePath);
+      if (conflictingWorktree) {
+        const conflictingGitPath = path.join(conflictingWorktree, '.git');
+        const conflictingWorktreeHasGit = await fs
+          .access(conflictingGitPath)
+          .then(() => true)
+          .catch(() => false);
+        if (!conflictingWorktreeHasGit) {
+          logger.log(
+            `[${repoName}] Found stale worktree registration for ${branchName} at ${conflictingWorktree}; pruning...`
           );
+          await forceRemoveWorktree(repoPath, conflictingWorktree, logger, {
+            context: `[${repoName}]`,
+          });
         }
 
-        logger.log(
-          `[${repoName}] Removing stale worktree using branch ${branchName}: ${conflictingWorktree}`
-        );
-        await execa('git', ['worktree', 'remove', conflictingWorktree, '--force'], {
-          cwd: repoPath,
-        });
+        const normalizedConflictingWorktree = await canonicalizePath(conflictingWorktree);
+        if (normalizedConflictingWorktree !== normalizedRequestedWorktree) {
+          const normalizedBase = await canonicalizePath(worktreeBasePath);
+          const isManagedWorktree =
+            normalizedConflictingWorktree === normalizedBase ||
+            normalizedConflictingWorktree.startsWith(`${normalizedBase}${path.sep}`);
+
+          if (!isManagedWorktree) {
+            throw new Error(
+              `Branch "${branchName}" is already checked out at "${conflictingWorktree}" (outside managed worktree base "${worktreeBasePath}"). Remove it manually and retry.`
+            );
+          }
+
+          logger.log(
+            `[${repoName}] Removing stale worktree using branch ${branchName}: ${conflictingWorktree}`
+          );
+          await forceRemoveWorktree(repoPath, conflictingWorktree, logger, {
+            context: `[${repoName}]`,
+          });
+        }
       }
 
       // Delete existing branch if it exists (local and remote) so we start fresh
@@ -285,15 +360,24 @@ export async function setupMultiRepoWorktrees(options: ScaffoldOptions): Promise
 
   if (failures.length > 0) {
     // Best-effort rollback so setup failures do not leave partial worktrees behind.
+    let allWorktreesRemoved = true;
     for (const repoName of configuredRepos) {
       const repoPath = path.join(reposDir, repoName);
       const worktreePath = path.join(workspacePath, repoName);
-      await cleanupWorktree(repoPath, worktreePath);
+      const removed = await cleanupWorktree(repoPath, worktreePath);
+      if (!removed) allWorktreesRemoved = false;
     }
-    try {
-      await fs.rm(workspacePath, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup errors while surfacing the original failure.
+
+    if (allWorktreesRemoved) {
+      try {
+        await fs.rm(workspacePath, { recursive: true, force: true });
+      } catch {
+        // Ignore cleanup errors while surfacing the original failure.
+      }
+    } else {
+      logger.error(
+        `Leaving workspace at ${workspacePath} because one or more worktrees could not be removed.`
+      );
     }
 
     throw new Error(`Failed to setup worktrees:\n${failures.join('\n')}`);
@@ -318,14 +402,14 @@ async function cleanupWorktree(
   repoPath: string,
   worktreePath: string,
   logger: Logger = consoleLogger
-): Promise<void> {
+): Promise<boolean> {
   logger.log(`Cleaning up worktree at ${worktreePath}...`);
   try {
-    await execa('git', ['worktree', 'remove', worktreePath, '--force'], {
-      cwd: repoPath,
-    });
+    await forceRemoveWorktree(repoPath, worktreePath, logger);
+    return true;
   } catch (error) {
     logger.error(`Failed to remove worktree: ${error}`);
+    return false;
   }
 }
 
@@ -333,14 +417,23 @@ async function cleanupWorktree(
  * Cleans up all worktrees in a workspace
  */
 export async function cleanupMultiRepoWorktrees(result: ScaffoldResult): Promise<void> {
+  let allWorktreesRemoved = true;
   for (const repo of result.repos) {
-    await cleanupWorktree(repo.originalPath, repo.worktreePath);
+    const removed = await cleanupWorktree(repo.originalPath, repo.worktreePath);
+    if (!removed) allWorktreesRemoved = false;
   }
-  // Remove the workspace directory
-  try {
-    await fs.rm(result.workspacePath, { recursive: true, force: true });
-  } catch {
-    // Ignore cleanup errors
+
+  if (allWorktreesRemoved) {
+    // Remove the workspace directory
+    try {
+      await fs.rm(result.workspacePath, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup errors
+    }
+  } else {
+    consoleLogger.error(
+      `Leaving workspace at ${result.workspacePath} because one or more worktrees could not be removed.`
+    );
   }
 }
 

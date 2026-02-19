@@ -1,5 +1,9 @@
 # Release Notes
 
+## [v0.1.4](https://github.com/RelevanceAI/bye-bye-flag/pull/4)
+
+Adds an exact per-flag PR safety check before agent execution and increases bulk PR discovery depth to reduce missed historical declined/open PRs.
+
 ## [v0.1.3](https://github.com/RelevanceAI/bye-bye-flag/pull/3)
 
 Fixes worktree lifecycle edge cases by canonicalizing `/tmp` vs `/private/tmp` paths, pruning stale git worktree metadata, and preventing workspace deletion when per-repo worktree cleanup fails.

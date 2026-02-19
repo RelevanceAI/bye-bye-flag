@@ -293,7 +293,7 @@ export async function findExistingPR(repoPath: string, flagKey: string): Promise
  */
 export async function fetchAllFlagPRs(repoPath: string): Promise<Map<string, ExistingPR>> {
   try {
-    return await fetchPRSafetyStates(repoPath, { limit: 500 });
+    return await fetchPRSafetyStates(repoPath, { limit: 1000 });
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new Error(`Failed to fetch PRs for ${repoPath}: ${message}`, {
